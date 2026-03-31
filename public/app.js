@@ -651,7 +651,7 @@ async function sendComposerMessage(event) {
     setBanner(`发送失败：${error.message}`, 'error');
   } finally {
     state.isSending = false;
-    renderConversation();
+    el.sendMessageBtn.disabled = false;
   }
 }
 
@@ -701,6 +701,7 @@ function appendDeltaToItem(threadId, turnId, itemId, delta, targetField = 'text'
 }
 
 function handleJsonRpc(msg) {
+  console.log('[SSE]', msg.method, msg.params);
   addRawEvent(msg.method || 'response', msg);
 
   if (msg.method && Object.prototype.hasOwnProperty.call(msg, 'id')) {
@@ -789,23 +790,31 @@ function handleJsonRpc(msg) {
       break;
     }
     case 'item/agentMessage/delta': {
-      appendDeltaToItem(msg.params?.threadId, msg.params?.turnId, msg.params?.itemId, msg.params?.delta || '', 'text');
+      const threadId = msg.params?.threadId || state.activeThreadId;
+      if (!threadId) break;
+      appendDeltaToItem(threadId, msg.params?.turnId, msg.params?.itemId, msg.params?.delta || '', 'text');
       renderConversation();
       break;
     }
     case 'item/reasoning/textDelta':
     case 'item/reasoning/summaryTextDelta': {
-      appendDeltaToItem(msg.params?.threadId, msg.params?.turnId, msg.params?.itemId, msg.params?.delta || msg.params?.textDelta || '', 'text');
+      const threadId = msg.params?.threadId || state.activeThreadId;
+      if (!threadId) break;
+      appendDeltaToItem(threadId, msg.params?.turnId, msg.params?.itemId, msg.params?.delta || msg.params?.textDelta || '', 'text');
       renderConversation();
       break;
     }
     case 'item/commandExecution/outputDelta': {
-      appendDeltaToItem(msg.params?.threadId, msg.params?.turnId, msg.params?.itemId, msg.params?.delta || msg.params?.output || '', 'aggregatedOutput');
+      const threadId = msg.params?.threadId || state.activeThreadId;
+      if (!threadId) break;
+      appendDeltaToItem(threadId, msg.params?.turnId, msg.params?.itemId, msg.params?.delta || msg.params?.output || '', 'aggregatedOutput');
       renderConversation();
       break;
     }
     case 'item/fileChange/outputDelta': {
-      appendDeltaToItem(msg.params?.threadId, msg.params?.turnId, msg.params?.itemId, msg.params?.delta || '', 'output');
+      const threadId = msg.params?.threadId || state.activeThreadId;
+      if (!threadId) break;
+      appendDeltaToItem(threadId, msg.params?.turnId, msg.params?.itemId, msg.params?.delta || '', 'output');
       renderConversation();
       break;
     }
@@ -853,7 +862,8 @@ function connectEvents() {
     }
     addRawEvent(payload.type, payload.payload);
   };
-  source.onerror = () => {
+  source.onerror = (error) => {
+    console.error('[SSE] 连接错误:', error);
     setBanner('SSE 连接暂时断开，浏览器会自动重连。', 'error');
   };
 }
