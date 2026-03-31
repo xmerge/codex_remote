@@ -638,12 +638,38 @@ async function sendComposerMessage(event) {
         method: 'POST',
         body: JSON.stringify({ text }),
       });
+      // 乐观更新：立即添加用户消息到现有 turn
+      const userMessage = {
+        id: `temp-user-${Date.now()}`,
+        type: 'userMessage',
+        content: [{ type: 'text', text }],
+      };
+      mergeItemIntoTurn(thread.id, activeTurnId, userMessage);
+      renderConversation();
       addRawEvent('turn.steer', { threadId: thread.id, turnId: activeTurnId, text });
     } else {
-      await api(`/api/threads/${encodeURIComponent(thread.id)}/turns`, {
+      const result = await api(`/api/threads/${encodeURIComponent(thread.id)}/turns`, {
         method: 'POST',
         body: JSON.stringify({ text }),
       });
+      const newTurnId = result?.turn?.id;
+      if (newTurnId) {
+        // 确保新 turn 存在于本地状态
+        const turns = state.currentThread.turns || (state.currentThread.turns = []);
+        const existingTurn = turns.find((t) => t.id === newTurnId);
+        if (!existingTurn) {
+          turns.push({ id: newTurnId, threadId: thread.id, status: 'inProgress', items: [] });
+        }
+        state.activeTurnIdByThread.set(thread.id, newTurnId);
+        // 乐观更新：立即添加用户消息到新 turn
+        const userMessage = {
+          id: `temp-user-${Date.now()}`,
+          type: 'userMessage',
+          content: [{ type: 'text', text }],
+        };
+        mergeItemIntoTurn(thread.id, newTurnId, userMessage);
+        renderConversation();
+      }
       addRawEvent('turn.start', { threadId: thread.id, text });
     }
     el.composerInput.value = '';
