@@ -1,0 +1,13 @@
+{
+  "name": "codex-remote-web-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal remote web client for Codex app-server with threads, chat, streaming output, approvals, and diff preview.",
+  "scripts": {
+    "start": "node server.js",
+    "start:mock": "MOCK_MODE=1 node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

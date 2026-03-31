@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0a0f17" />
+    <title>Codex Remote Web MVP</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brandbar">
+          <div class="brand-copy">
+            <span class="eyebrow">Codex Remote</span>
+            <h1>Remote Console</h1>
+            <p>会话、对话和审批都放在一个真正可用的控制台里。</p>
+          </div>
+        </div>
+
+        <section class="card compact sidebar-card">
+          <div class="section-head">
+            <div>
+              <strong>连接</strong>
+              <span>本地 daemon / app-server</span>
+            </div>
+            <button id="refreshHealthBtn" class="ghost">刷新</button>
+          </div>
+          <div id="healthPanel" class="health-grid"></div>
+          <div id="statusBanner" class="status-banner muted">等待连接…</div>
+        </section>
+
+        <section class="card compact sidebar-card">
+          <div class="section-head">
+            <div>
+              <strong>新会话</strong>
+              <span>快速创建</span>
+            </div>
+            <button id="newThreadBtn" class="primary">新建</button>
+          </div>
+          <div class="form-grid">
+            <label>
+              <span>模型</span>
+              <input id="newThreadModel" type="text" value="gpt-5.4" placeholder="gpt-5.4" />
+            </label>
+            <label class="span-two">
+              <span>工作目录</span>
+              <input id="newThreadCwd" type="text" placeholder="/Users/me/project" />
+            </label>
+            <label>
+              <span>审批</span>
+              <select id="newThreadApprovalPolicy">
+                <option value="untrusted">untrusted</option>
+                <option value="on-request">on-request</option>
+                <option value="on-failure">on-failure</option>
+                <option value="granular">granular</option>
+                <option value="never">never</option>
+              </select>
+            </label>
+            <label>
+              <span>沙箱</span>
+              <select id="newThreadSandboxType">
+                <option value="workspaceWrite">workspaceWrite</option>
+                <option value="readOnly">readOnly</option>
+                <option value="dangerFullAccess">dangerFullAccess</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="card compact sidebar-card thread-pane">
+          <div class="section-head">
+            <div>
+              <strong>会话</strong>
+              <span>最近更新优先</span>
+            </div>
+            <button id="refreshThreadsBtn" class="ghost">刷新</button>
+          </div>
+          <div id="threadList" class="thread-list"></div>
+        </section>
+      </aside>
+
+      <main class="main">
+        <header class="card compact main-header">
+          <div class="thread-header-copy">
+            <span class="eyebrow">Active Thread</span>
+            <h2 id="activeThreadTitle">未选择会话</h2>
+            <p id="activeThreadMeta" class="muted">先从左侧选一个会话，或新建一个。</p>
+          </div>
+          <div class="row gap-wrap">
+            <button id="resumeThreadBtn" class="ghost" disabled>恢复</button>
+            <button id="reloadThreadBtn" class="ghost" disabled>重载</button>
+            <button id="interruptTurnBtn" class="danger" disabled>中断</button>
+          </div>
+        </header>
+
+        <section class="conversation-stage">
+          <div id="conversationFeed" class="conversation-feed card"></div>
+
+          <form id="composerForm" class="composer card compact">
+            <textarea id="composerInput" rows="4" placeholder="给 Codex 发消息；如果当前 turn 还在运行，会自动走 steer。"></textarea>
+            <div class="composer-row">
+              <div class="muted" id="composerHint">主区只展示对话主线；审批、diff、事件放到底部工具栏。</div>
+              <button id="sendMessageBtn" type="submit" class="primary" disabled>发送</button>
+            </div>
+          </form>
+        </section>
+
+        <section id="utilityTray" class="utility-tray card compact is-collapsed">
+          <div class="utility-bar">
+            <div class="utility-tabs">
+              <button id="utilityTabApprovals" type="button" class="utility-tab active" data-utility-tab="approvals">
+                审批
+                <span id="approvalCount" class="badge">0</span>
+              </button>
+              <button id="utilityTabDiff" type="button" class="utility-tab" data-utility-tab="diff">
+                Diff
+                <span id="diffMeta" class="utility-pill">无</span>
+              </button>
+              <button id="utilityTabEvents" type="button" class="utility-tab" data-utility-tab="events">
+                事件
+              </button>
+            </div>
+            <div class="row">
+              <button id="clearEventsBtn" class="ghost">清空事件</button>
+              <button id="toggleUtilityBtn" type="button" class="ghost">展开工具栏</button>
+            </div>
+          </div>
+
+          <div class="utility-content">
+            <section id="utilityPanelApprovals" class="utility-panel is-active">
+              <div id="approvalList" class="stack utility-stack"></div>
+            </section>
+
+            <section id="utilityPanelDiff" class="utility-panel">
+              <pre id="diffPreview" class="code-block empty">暂无 diff</pre>
+            </section>
+
+            <section id="utilityPanelEvents" class="utility-panel">
+              <div id="eventLog" class="event-log"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <template id="threadItemTemplate">
+      <button class="thread-item">
+        <div class="thread-item-title"></div>
+        <div class="thread-item-preview"></div>
+        <div class="thread-item-meta"></div>
+      </button>
+    </template>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
