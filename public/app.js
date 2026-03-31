@@ -10,6 +10,7 @@ const state = {
   activeTurnIdByThread: new Map(),
   sse: null,
   isSending: false,
+  isLoading: false,
   utilityTab: 'approvals',
   utilityTrayOpen: false,
 };
@@ -131,9 +132,21 @@ async function api(path, options = {}) {
   return payload;
 }
 
+let bannerTimeout = null;
+
 function setBanner(message, kind = 'info') {
   el.statusBanner.textContent = message;
   el.statusBanner.className = `status-banner ${kind === 'error' ? 'error' : ''}`.trim();
+
+  if (bannerTimeout) {
+    clearTimeout(bannerTimeout);
+  }
+  bannerTimeout = setTimeout(() => {
+    if (el.statusBanner.textContent === message) {
+      el.statusBanner.textContent = '';
+      el.statusBanner.className = 'status-banner';
+    }
+  }, 5000);
 }
 
 function addRawEvent(label, data) {
@@ -241,7 +254,6 @@ function renderThreadList() {
     fragment.querySelector('.thread-item-preview').textContent = thread.preview || '暂无预览';
     const status = thread.status?.type || 'unknown';
     fragment.querySelector('.thread-item-meta').textContent = `${fmtCompactTime(thread.updatedAt)} · ${status}`;
-    button.addEventListener('click', () => openThread(thread.id));
     el.threadList.appendChild(fragment);
   }
 }
@@ -446,22 +458,6 @@ function renderApprovals() {
       `;
     })
     .join('');
-
-  el.approvalList.querySelectorAll('button[data-request-id]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      const requestId = button.dataset.requestId;
-      const decision = button.dataset.decision;
-      try {
-        await api(`/api/approvals/${encodeURIComponent(requestId)}`, {
-          method: 'POST',
-          body: JSON.stringify({ decision }),
-        });
-        addRawEvent('approval.response', { requestId, decision });
-      } catch (error) {
-        setBanner(`审批回包失败：${error.message}`, 'error');
-      }
-    });
-  });
 }
 
 function renderDiffPreview() {
@@ -538,10 +534,16 @@ async function loadPendingApprovals() {
 }
 
 async function loadThreads() {
-  const result = await api('/api/threads?limit=50&sortKey=updated_at');
-  syncThreadsFromList(result.data || []);
-  if (!state.activeThreadId && state.threads.length) {
-    await openThread(state.threads[0].id, { silent: true });
+  state.isLoading = true;
+  el.threadList.innerHTML = '<div class="muted">加载中...</div>';
+  try {
+    const result = await api('/api/threads?limit=50&sortKey=updated_at');
+    syncThreadsFromList(result.data || []);
+    if (!state.activeThreadId && state.threads.length) {
+      await openThread(state.threads[0].id, { silent: true });
+    }
+  } finally {
+    state.isLoading = false;
   }
 }
 
@@ -583,12 +585,21 @@ async function createThreadFromForm() {
     ? { type: 'workspaceWrite', writableRoots: cwd ? [cwd] : [], networkAccess: true }
     : { type: sandboxType };
 
-  const result = await api('/api/threads', {
-    method: 'POST',
-    body: JSON.stringify({ model, cwd: cwd || undefined, approvalPolicy, sandboxPolicy }),
-  });
-  await loadThreads();
-  await openThread(result.thread.id);
+  el.newThreadBtn.disabled = true;
+  el.newThreadBtn.textContent = '创建中...';
+  state.isLoading = true;
+  try {
+    const result = await api('/api/threads', {
+      method: 'POST',
+      body: JSON.stringify({ model, cwd: cwd || undefined, approvalPolicy, sandboxPolicy }),
+    });
+    await loadThreads();
+    await openThread(result.thread.id);
+  } finally {
+    el.newThreadBtn.disabled = false;
+    el.newThreadBtn.textContent = '新建会话';
+    state.isLoading = false;
+  }
 }
 
 async function ensureThreadReadyForTurn(thread) {
@@ -631,6 +642,7 @@ async function sendComposerMessage(event) {
   const activeTurnId = deriveActiveTurnId(thread);
   state.isSending = true;
   el.sendMessageBtn.disabled = true;
+  el.composerInput.disabled = true;
 
   try {
     if (activeTurnId) {
@@ -655,7 +667,7 @@ async function sendComposerMessage(event) {
       const newTurnId = result?.turn?.id;
       if (newTurnId) {
         // 确保新 turn 存在于本地状态
-        const turns = state.currentThread.turns || (state.currentThread.turns = []);
+        const turns = state.currentThread?.turns || (state.currentThread.turns = []);
         const existingTurn = turns.find((t) => t.id === newTurnId);
         if (!existingTurn) {
           turns.push({ id: newTurnId, threadId: thread.id, status: 'inProgress', items: [] });
@@ -678,6 +690,7 @@ async function sendComposerMessage(event) {
   } finally {
     state.isSending = false;
     el.sendMessageBtn.disabled = false;
+    el.composerInput.disabled = false;
   }
 }
 
@@ -862,13 +875,29 @@ function handleJsonRpc(msg) {
 }
 
 function connectEvents() {
+  const isReconnect = !!state.sse;
   if (state.sse) {
     state.sse.close();
   }
   const source = new EventSource('/api/events');
   state.sse = source;
+
+  source.onopen = () => {
+    if (isReconnect) {
+      setBanner('SSE 已重新连接');
+      addRawEvent('sse.reconnect', { timestamp: new Date().toISOString() });
+    }
+  };
+
   source.onmessage = (event) => {
-    const payload = JSON.parse(event.data);
+    let payload;
+    try {
+      payload = JSON.parse(event.data);
+    } catch (parseError) {
+      console.error('[SSE] JSON 解析失败:', parseError, event.data);
+      addRawEvent('parseError', { error: parseError.message, raw: event.data });
+      return;
+    }
     if (payload.type === 'connection') {
       state.health = payload.payload;
       renderHealth();
@@ -964,12 +993,43 @@ async function initialize() {
     setUtilityTrayOpen(true);
   });
 
+  // 事件委托：线程列表点击
+  el.threadList.addEventListener('click', (event) => {
+    const button = event.target.closest('.thread-item');
+    if (button?.dataset.threadId) {
+      openThread(button.dataset.threadId);
+    }
+  });
+
+  // 事件委托：审批按钮点击
+  el.approvalList.addEventListener('click', async (event) => {
+    const button = event.target.closest('button[data-request-id]');
+    if (!button) return;
+    const requestId = button.dataset.requestId;
+    const decision = button.dataset.decision;
+    try {
+      await api(`/api/approvals/${encodeURIComponent(requestId)}`, {
+        method: 'POST',
+        body: JSON.stringify({ decision }),
+      });
+      addRawEvent('approval.response', { requestId, decision });
+    } catch (error) {
+      setBanner(`审批回包失败：${error.message}`, 'error');
+    }
+  });
+
   renderUtilityTray();
   connectEvents();
-  await Promise.all([loadHealth(), loadPendingApprovals(), loadThreads()]);
-  renderConversation();
-  renderEventLog();
-  renderUtilityTray();
+  state.isLoading = true;
+  setBanner('正在初始化...');
+  try {
+    await Promise.all([loadHealth(), loadPendingApprovals(), loadThreads()]);
+    renderConversation();
+    renderEventLog();
+    renderUtilityTray();
+  } finally {
+    state.isLoading = false;
+  }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
