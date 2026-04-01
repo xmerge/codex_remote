@@ -116,8 +116,10 @@ function escapeHtml(value) {
 }
 
 async function api(path, options = {}) {
+  const { signal, ...restOptions } = options;
   const response = await fetch(path, {
-    ...options,
+    ...restOptions,
+    signal,
     headers: {
       'Content-Type': 'application/json',
       ...(options.headers || {}),
@@ -621,6 +623,8 @@ async function ensureThreadReadyForTurn(thread) {
 
 async function sendComposerMessage(event) {
   event.preventDefault();
+  if (state.isSending) return; // 防止重复发送
+
   const text = el.composerInput.value.trim();
   if (!text) return;
 
@@ -668,18 +672,28 @@ async function sendComposerMessage(event) {
   state.isSending = true;
   el.sendMessageBtn.disabled = true;
   el.composerInput.disabled = true;
+  el.sendMessageBtn.textContent = '发送中...';
+
+  // 超时控制：30秒后自动恢复
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+    setBanner('请求超时，已自动恢复', 'error');
+  }, 30000);
 
   try {
     if (activeTurnId) {
       await api(`/api/threads/${encodeURIComponent(thread.id)}/turns/${encodeURIComponent(activeTurnId)}/steer`, {
         method: 'POST',
         body: JSON.stringify({ text }),
+        signal: controller.signal,
       });
       addRawEvent('turn.steer', { threadId: thread.id, turnId: activeTurnId, text });
     } else {
       const result = await api(`/api/threads/${encodeURIComponent(thread.id)}/turns`, {
         method: 'POST',
         body: JSON.stringify({ text }),
+        signal: controller.signal,
       });
       const newTurnId = result?.turn?.id;
       if (newTurnId) {
@@ -695,12 +709,18 @@ async function sendComposerMessage(event) {
       addRawEvent('turn.start', { threadId: thread.id, text });
     }
   } catch (error) {
-    setBanner(`发送失败：${error.message}`, 'error');
+    if (error.name === 'AbortError') {
+      // 超时导致的 abort，已在 timeout 回调中设置 banner
+    } else {
+      setBanner(`发送失败：${error.message}`, 'error');
+    }
     // 保留用户消息，但可以选择移除临时 turn
   } finally {
+    clearTimeout(timeoutId);
     state.isSending = false;
     el.sendMessageBtn.disabled = false;
     el.composerInput.disabled = false;
+    el.sendMessageBtn.textContent = '发送';
   }
 }
 
