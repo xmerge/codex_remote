@@ -226,7 +226,12 @@ function deriveActiveTurnId(thread) {
 function upsertThread(thread) {
   if (!thread?.id) return;
   const existing = state.threadMap.get(thread.id) || {};
-  const merged = { ...existing, ...thread };
+  // 深拷贝 turns 数组，避免引用问题
+  const merged = {
+    ...existing,
+    ...thread,
+    turns: thread.turns ? [...thread.turns] : existing.turns,
+  };
   state.threadMap.set(thread.id, merged);
 }
 
@@ -639,8 +644,33 @@ let fallbackTimeoutId = null;
 async function sendComposerMessage(event) {
   event.preventDefault();
 
+  // 防御性检查 1: 检查 state.currentThread 是否存在
+  if (!state.currentThread?.id) {
+    setBanner('请先选择或创建一个会话', 'error');
+    return;
+  }
+
   // 检查是否有活跃的 turn（正在进行中的 turn）
   const currentActiveTurnId = deriveActiveTurnId(state.currentThread);
+
+  // 防御性检查 2: 检查状态一致性
+  // 如果有活跃 turn 且 isSending 为 false，说明状态可能不一致
+  if (currentActiveTurnId && !state.isSending) {
+    console.warn('[sendComposerMessage] 状态不一致：有活跃 turn 但 isSending 为 false', {
+      activeTurnId: currentActiveTurnId,
+      isSending: state.isSending,
+    });
+  }
+
+  // 防御性检查 3: 如果 isSending 为 true，检查是否真的有活跃 turn
+  if (state.isSending && !currentActiveTurnId) {
+    // isSending 为 true 但没有活跃 turn，可能是之前的状态未正确恢复
+    console.warn('[sendComposerMessage] 状态不一致：isSending 为 true 但没有活跃 turn，自动恢复');
+    state.isSending = false;
+    el.sendMessageBtn.disabled = false;
+    el.composerInput.disabled = false;
+    el.sendMessageBtn.textContent = '发送';
+  }
 
   // 防止重复发送：如果有活跃 turn 且正在发送，不允许
   if (state.isSending && currentActiveTurnId) {
@@ -936,6 +966,8 @@ function handleJsonRpc(msg) {
           if (existing) {
             existing.status = turn.status || 'completed';
             if (turn.items) existing.items = turn.items;
+          } else {
+            console.warn('[turn/completed] 在 threadMap 中未找到 turn:', turn.id);
           }
         }
 
@@ -945,6 +977,8 @@ function handleJsonRpc(msg) {
           if (existing) {
             existing.status = turn.status || 'completed';
             if (turn.items) existing.items = turn.items;
+          } else {
+            console.warn('[turn/completed] 在 currentThread 中未找到 turn:', turn.id);
           }
         }
 
@@ -970,9 +1004,6 @@ function handleJsonRpc(msg) {
         renderConversation();
         renderActiveThreadHeader();
         loadThreads().catch(() => {});
-        if (threadId) {
-          refreshThreadFromServer(threadId).catch(() => {});
-        }
       }
       break;
     }
