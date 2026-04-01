@@ -953,7 +953,7 @@ function handleJsonRpc(msg) {
       console.log('[turn/completed] 收到事件:', { turn, currentThreadId: state.currentThread?.id, isSending: state.isSending });
 
       if (turn) {
-        const threadId = turn.threadId;
+        const threadId = msg.params?.threadId;  // threadId 在 params 中，不在 turn 中
         const isCurrentThread = state.currentThread?.id === threadId;
 
         console.log('[turn/completed] 检查条件:', { threadId, isCurrentThread });
