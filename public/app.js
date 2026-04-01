@@ -270,6 +270,7 @@ function renderActiveThreadHeader() {
     el.reloadThreadBtn.disabled = true;
     el.interruptTurnBtn.disabled = true;
     el.sendMessageBtn.disabled = true;
+    el.sendMessageBtn.textContent = '发送';
     return;
   }
 
@@ -278,10 +279,21 @@ function renderActiveThreadHeader() {
   el.activeThreadMeta.textContent = `${status} · 更新于 ${fmtTime(thread.updatedAt)} · 线程 ${shortId(thread.id)}`;
   el.resumeThreadBtn.disabled = false;
   el.reloadThreadBtn.disabled = false;
+
+  // 中断按钮：有活跃 turn 时可用
   el.interruptTurnBtn.disabled = !activeTurnId;
-  el.sendMessageBtn.disabled = false;
-  el.sendMessageBtn.textContent = '发送';
-  state.activeTurnIdByThread.set(thread.id, activeTurnId || null);
+
+  // 发送按钮：根据发送状态决定
+  if (state.isSending) {
+    el.sendMessageBtn.disabled = true;
+    el.sendMessageBtn.textContent = activeTurnId ? '发送中...' : '创建中...';
+  } else {
+    el.sendMessageBtn.disabled = false;
+    el.sendMessageBtn.textContent = '发送';
+  }
+
+  // 输入框状态：发送中禁用
+  el.composerInput.disabled = state.isSending;
 }
 
 function renderItem(item) {
@@ -623,7 +635,14 @@ async function ensureThreadReadyForTurn(thread) {
 
 async function sendComposerMessage(event) {
   event.preventDefault();
-  if (state.isSending) return; // 防止重复发送
+
+  // 检查是否有活跃的 turn（正在进行中的 turn）
+  const currentActiveTurnId = deriveActiveTurnId(state.currentThread);
+
+  // 防止重复发送：如果有活跃 turn 且正在发送，不允许
+  if (state.isSending && currentActiveTurnId) {
+    return;
+  }
 
   const text = el.composerInput.value.trim();
   if (!text) return;
@@ -643,6 +662,7 @@ async function sendComposerMessage(event) {
     return;
   }
 
+  // 再次获取活跃 turn（确保线程准备好后状态正确）
   const activeTurnId = deriveActiveTurnId(thread);
 
   // 乐观更新：先创建用户消息并渲染
@@ -653,33 +673,39 @@ async function sendComposerMessage(event) {
     content: [{ type: 'text', text }],
   };
 
+  // 记录是否是新 turn（用于后续判断）
+  let tempTurnId = null;
+  let isNewTurn = !activeTurnId;
+
   if (activeTurnId) {
     // Steer 现有 turn：直接添加到现有 turn
     mergeItemIntoTurn(thread.id, activeTurnId, userMessage);
     renderConversation();
   } else {
     // 新 turn：先创建临时 turn
-    const tempTurnId = `temp-turn-${Date.now()}`;
+    tempTurnId = `temp-turn-${Date.now()}`;
     const turns = state.currentThread?.turns || (state.currentThread.turns = []);
     turns.push({ id: tempTurnId, threadId: thread.id, status: 'inProgress', items: [userMessage] });
-    state.activeTurnIdByThread.set(thread.id, tempTurnId);
     renderConversation();
   }
 
   // 清空输入框
   el.composerInput.value = '';
 
+  // 设置发送状态（不再在 finally 中恢复，而是在 turn/completed 中恢复）
   state.isSending = true;
   el.sendMessageBtn.disabled = true;
   el.composerInput.disabled = true;
-  el.sendMessageBtn.textContent = '发送中...';
+  el.sendMessageBtn.textContent = isNewTurn ? '创建中...' : '发送中...';
 
-  // 超时控制：30秒后自动恢复
+  // 超时控制：60秒后清理状态（延长超时时间）
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     controller.abort();
-    setBanner('请求超时，已自动恢复', 'error');
-  }, 30000);
+    // 超时时清理状态
+    cleanupSendState();
+    setBanner('请求超时，状态已恢复', 'error');
+  }, 60000);
 
   try {
     if (activeTurnId) {
@@ -689,6 +715,7 @@ async function sendComposerMessage(event) {
         signal: controller.signal,
       });
       addRawEvent('turn.steer', { threadId: thread.id, turnId: activeTurnId, text });
+      // steer 成功后，不恢复状态，等待 turn/completed 事件
     } else {
       const result = await api(`/api/threads/${encodeURIComponent(thread.id)}/turns`, {
         method: 'POST',
@@ -699,28 +726,71 @@ async function sendComposerMessage(event) {
       if (newTurnId) {
         // 用真实 turn ID 替换临时 ID
         const turns = state.currentThread?.turns || [];
-        const tempTurn = turns.find((t) => t.id.startsWith('temp-turn-'));
+        const tempTurn = turns.find((t) => t.id === tempTurnId);
         if (tempTurn) {
           tempTurn.id = newTurnId;
-          state.activeTurnIdByThread.set(thread.id, newTurnId);
           renderConversation();
         }
       }
       addRawEvent('turn.start', { threadId: thread.id, text });
+      // 新 turn 创建成功，不恢复状态，等待 turn/completed 事件
     }
+    clearTimeout(timeoutId);
   } catch (error) {
+    clearTimeout(timeoutId);
     if (error.name === 'AbortError') {
-      // 超时导致的 abort，已在 timeout 回调中设置 banner
+      // 超时导致的 abort，已在 timeout 回调中处理
     } else {
       setBanner(`发送失败：${error.message}`, 'error');
+      // 发送失败时清理乐观更新的数据
+      if (isNewTurn && tempTurnId) {
+        cleanupOptimisticTurn(thread.id, tempTurnId);
+      } else if (activeTurnId) {
+        cleanupOptimisticMessage(thread.id, activeTurnId, tempMessageId);
+      }
     }
-    // 保留用户消息，但可以选择移除临时 turn
-  } finally {
-    clearTimeout(timeoutId);
-    state.isSending = false;
-    el.sendMessageBtn.disabled = false;
-    el.composerInput.disabled = false;
-    el.sendMessageBtn.textContent = '发送';
+    // 发送失败时恢复状态
+    cleanupSendState();
+  }
+  // 注意：成功时不在 finally 中恢复状态，状态在 turn/completed 中恢复
+}
+
+/**
+ * 清理发送状态
+ */
+function cleanupSendState() {
+  state.isSending = false;
+  el.sendMessageBtn.disabled = false;
+  el.composerInput.disabled = false;
+  el.sendMessageBtn.textContent = '发送';
+}
+
+/**
+ * 清理乐观更新的临时 turn
+ */
+function cleanupOptimisticTurn(threadId, tempTurnId) {
+  if (state.currentThread?.id !== threadId) return;
+  const turns = state.currentThread.turns || [];
+  const index = turns.findIndex((t) => t.id === tempTurnId);
+  if (index !== -1) {
+    turns.splice(index, 1);
+    renderConversation();
+  }
+}
+
+/**
+ * 清理乐观更新的临时消息
+ */
+function cleanupOptimisticMessage(threadId, turnId, tempMessageId) {
+  const thread = state.currentThread;
+  if (!thread || thread.id !== threadId) return;
+  const turn = (thread.turns || []).find((t) => t.id === turnId);
+  if (!turn) return;
+  const items = turn.items || [];
+  const index = items.findIndex((item) => item.id === tempMessageId);
+  if (index !== -1) {
+    items.splice(index, 1);
+    renderConversation();
   }
 }
 
@@ -806,8 +876,18 @@ function handleJsonRpc(msg) {
       if (turn?.threadId && state.currentThread?.id === turn.threadId) {
         const turns = state.currentThread.turns || (state.currentThread.turns = []);
         const exists = turns.find((candidate) => candidate.id === turn.id);
-        if (!exists) turns.push({ ...turn, items: [] });
-        state.activeTurnIdByThread.set(turn.threadId, turn.id);
+        if (!exists) {
+          // 检查是否有临时 turn 需要替换
+          const tempTurn = turns.find((t) => t.id?.toString().startsWith('temp-turn-'));
+          if (tempTurn) {
+            // 替换临时 turn
+            tempTurn.id = turn.id;
+            Object.assign(tempTurn, turn);
+            if (!tempTurn.items) tempTurn.items = [];
+          } else {
+            turns.push({ ...turn, items: [] });
+          }
+        }
         renderConversation();
       }
       break;
@@ -818,21 +898,22 @@ function handleJsonRpc(msg) {
         const turns = state.currentThread.turns || (state.currentThread.turns = []);
         const existing = turns.find((candidate) => candidate.id === turn.id);
         if (existing) {
-          Object.assign(existing, turn);
-        } else {
-          turns.push(turn);
-        }
-        // 确保 turn 状态为 completed
-        if (existing) {
+          // 只更新必要字段，不覆盖 status
           existing.status = 'completed';
+          if (turn.items) existing.items = turn.items;
+        } else {
+          turns.push({ ...turn, status: 'completed' });
         }
-        // 清除 activeTurnIdByThread 中的记录
+
+        // 清除 activeTurnId
         state.activeTurnIdByThread.delete(turn.threadId);
-        // 恢复发送状态
+
+        // 直接恢复发送状态（不需要检查 remainingActiveTurn）
         state.isSending = false;
         el.sendMessageBtn.disabled = false;
         el.composerInput.disabled = false;
         el.sendMessageBtn.textContent = '发送';
+
         renderConversation();
         refreshThreadFromServer(turn.threadId).catch(() => {});
       }
@@ -915,52 +996,86 @@ function handleJsonRpc(msg) {
 }
 
 function connectEvents() {
-  const isReconnect = !!state.sse;
-  if (state.sse) {
-    state.sse.close();
-  }
-  const source = new EventSource('/api/events');
-  state.sse = source;
+  // 重连相关变量
+  let reconnectAttempts = 0;
+  const maxReconnectDelay = 30000;
+  const baseReconnectDelay = 1000;
+  let reconnectTimer = null;
 
-  source.onopen = () => {
-    if (isReconnect) {
-      setBanner('SSE 已重新连接');
-      addRawEvent('sse.reconnect', { timestamp: new Date().toISOString() });
+  const connect = () => {
+    const isReconnect = reconnectAttempts > 0;
+
+    if (state.sse) {
+      state.sse.close();
+      state.sse = null;
     }
+
+    const source = new EventSource('/api/events');
+    state.sse = source;
+
+    source.onopen = () => {
+      reconnectAttempts = 0; // 重置重连计数
+      if (isReconnect) {
+        setBanner('SSE 已重新连接');
+        addRawEvent('sse.reconnect', { timestamp: new Date().toISOString() });
+        // 重连后刷新数据，确保状态同步
+        Promise.all([loadHealth(), loadThreads()]).catch(() => {});
+      }
+    };
+
+    source.onmessage = (event) => {
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch (parseError) {
+        console.error('[SSE] JSON 解析失败:', parseError, event.data);
+        addRawEvent('parseError', { error: parseError.message, raw: event.data });
+        return;
+      }
+      if (payload.type === 'connection') {
+        state.health = payload.payload;
+        renderHealth();
+        return;
+      }
+      if (payload.type === 'jsonrpc') {
+        handleJsonRpc(payload.payload);
+        return;
+      }
+      if (payload.type === 'stderr') {
+        addRawEvent('stderr', payload.payload.line);
+        return;
+      }
+      if (payload.type === 'parseError') {
+        addRawEvent('parseError', payload.payload);
+        return;
+      }
+      addRawEvent(payload.type, payload.payload);
+    };
+
+    source.onerror = () => {
+      console.error('[SSE] 连接错误');
+      source.close();
+      state.sse = null;
+
+      // 清除之前的重连定时器
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+
+      // 指数退避重连
+      const delay = Math.min(baseReconnectDelay * Math.pow(2, reconnectAttempts), maxReconnectDelay);
+      reconnectAttempts++;
+
+      setBanner(`SSE 连接断开，${Math.round(delay / 1000)}秒后重连...`, 'error');
+
+      reconnectTimer = setTimeout(() => {
+        addRawEvent('sse.reconnecting', { attempt: reconnectAttempts, delay });
+        connect();
+      }, delay);
+    };
   };
 
-  source.onmessage = (event) => {
-    let payload;
-    try {
-      payload = JSON.parse(event.data);
-    } catch (parseError) {
-      console.error('[SSE] JSON 解析失败:', parseError, event.data);
-      addRawEvent('parseError', { error: parseError.message, raw: event.data });
-      return;
-    }
-    if (payload.type === 'connection') {
-      state.health = payload.payload;
-      renderHealth();
-      return;
-    }
-    if (payload.type === 'jsonrpc') {
-      handleJsonRpc(payload.payload);
-      return;
-    }
-    if (payload.type === 'stderr') {
-      addRawEvent('stderr', payload.payload.line);
-      return;
-    }
-    if (payload.type === 'parseError') {
-      addRawEvent('parseError', payload.payload);
-      return;
-    }
-    addRawEvent(payload.type, payload.payload);
-  };
-  source.onerror = (error) => {
-    console.error('[SSE] 连接错误:', error);
-    setBanner('SSE 连接暂时断开，浏览器会自动重连。', 'error');
-  };
+  connect();
 }
 
 async function initialize() {
