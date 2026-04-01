@@ -5,11 +5,12 @@ const state = {
   activeThreadId: null,
   currentThread: null,
   pendingApprovals: new Map(),
+  pendingApprovalActions: new Map(),
   rawEvents: [],
   latestDiffByTurn: new Map(),
-  activeTurnIdByThread: new Map(),
   sse: null,
-  isSending: false,
+  lastEventSeq: 0,
+  pendingSend: null,
   isLoading: false,
   utilityTab: 'approvals',
   utilityTrayOpen: false,
@@ -223,6 +224,293 @@ function deriveActiveTurnId(thread) {
   return active?.id || null;
 }
 
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function visitThreadInstances(threadId, visitor) {
+  const visited = new Set();
+  const candidates = [];
+  if (state.currentThread?.id === threadId) {
+    candidates.push(state.currentThread);
+  }
+  const mapped = state.threadMap.get(threadId);
+  if (mapped) {
+    candidates.push(mapped);
+  }
+
+  for (const thread of candidates) {
+    if (!thread || visited.has(thread)) continue;
+    visited.add(thread);
+    visitor(thread);
+  }
+}
+
+function getPendingSendForThread(threadId) {
+  return state.pendingSend?.threadId === threadId ? state.pendingSend : null;
+}
+
+function matchesPendingSendTurn(pendingSend, turn) {
+  if (!pendingSend || !turn) return false;
+  if (pendingSend.threadId !== turn.threadId) return false;
+  return Boolean(
+    turn.id &&
+      (turn.id === pendingSend.realTurnId ||
+        turn.id === pendingSend.tempTurnId ||
+        turn.id === pendingSend.expectedTurnId),
+  );
+}
+
+function findMatchingTurn(thread, pendingSend) {
+  if (!thread?.turns?.length || !pendingSend) return null;
+
+  if (pendingSend.realTurnId || pendingSend.expectedTurnId) {
+    const exactId = pendingSend.realTurnId || pendingSend.expectedTurnId;
+    const exact = thread.turns.find((turn) => turn.id === exactId);
+    if (exact) return exact;
+  }
+
+  if (pendingSend.mode === 'start' && pendingSend.text) {
+    const recentTurns = [...thread.turns].reverse().slice(0, 5);
+    return (
+      recentTurns.find((turn) =>
+        (turn.items || []).some(
+          (item) =>
+            item.type === 'userMessage' &&
+            (item.content || []).some((part) => part.type === 'text' && part.text === pendingSend.text),
+        ),
+      ) || null
+    );
+  }
+
+  return null;
+}
+
+function normalizeUserMessageContent(content = []) {
+  const parts = Array.isArray(content) ? content : [];
+  const text = parts
+    .map((part) => {
+      if (!part || typeof part !== 'object') return '';
+      if (typeof part.text === 'string') return part.text;
+      if (typeof part.input === 'string') return part.input;
+      if (typeof part.value === 'string') return part.value;
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+
+  return text || JSON.stringify(parts);
+}
+
+function findOptimisticUserMessage(items, incomingItem) {
+  if (incomingItem?.type !== 'userMessage') return null;
+  const normalizedIncoming = normalizeUserMessageContent(incomingItem.content || []);
+  return (
+    items.find((candidate) => {
+      if (candidate?.type !== 'userMessage') return false;
+      if (!String(candidate.id || '').startsWith('temp-user-')) return false;
+      return normalizeUserMessageContent(candidate.content || []) === normalizedIncoming;
+    }) || null
+  );
+}
+
+function mergeTurnItems(existingItems = [], incomingItems = []) {
+  const merged = [...existingItems];
+  for (const incomingItem of incomingItems) {
+    let existing = merged.find((candidate) => candidate.id === incomingItem.id);
+    if (!existing) {
+      existing = findOptimisticUserMessage(merged, incomingItem);
+      if (existing) {
+        existing.id = incomingItem.id;
+      }
+    }
+    if (!existing) {
+      merged.push(incomingItem);
+      continue;
+    }
+    Object.assign(existing, incomingItem);
+  }
+  return merged;
+}
+
+function upsertTurnInState(threadId, incomingTurn, { allowPendingReplacement = false } = {}) {
+  if (!threadId || !incomingTurn?.id) return;
+
+  visitThreadInstances(threadId, (thread) => {
+    const turns = thread.turns || (thread.turns = []);
+    let existing = turns.find((candidate) => candidate.id === incomingTurn.id);
+
+    if (!existing && allowPendingReplacement) {
+      const pendingSend = getPendingSendForThread(threadId);
+      const tempTurnId = pendingSend?.tempTurnId;
+      if (tempTurnId) {
+        existing = turns.find((candidate) => candidate.id === tempTurnId);
+        if (existing) {
+          existing.id = incomingTurn.id;
+        }
+      }
+    }
+
+    if (!existing) {
+      turns.push({
+        ...incomingTurn,
+        items: Array.isArray(incomingTurn.items) ? [...incomingTurn.items] : [],
+      });
+      return;
+    }
+
+    existing.status = incomingTurn.status || existing.status;
+    existing.error = incomingTurn.error ?? existing.error ?? null;
+    if (Array.isArray(incomingTurn.items)) {
+      if (incomingTurn.items.length || !(existing.items || []).length) {
+        existing.items = mergeTurnItems(existing.items || [], incomingTurn.items);
+      }
+    }
+  });
+}
+
+function findTurnForUpdate(thread, threadId, turnId) {
+  if (!thread || !turnId) return null;
+  const turns = thread.turns || [];
+  const exact = turns.find((candidate) => candidate.id === turnId);
+  if (exact) return exact;
+
+  const pendingSend = getPendingSendForThread(threadId);
+  if (pendingSend?.tempTurnId) {
+    return turns.find((candidate) => candidate.id === pendingSend.tempTurnId) || null;
+  }
+
+  return null;
+}
+
+let fallbackTimeoutId = null;
+let threadReloadTimer = null;
+let recoveryPromise = null;
+
+function clearPendingSendTimeout() {
+  if (fallbackTimeoutId) {
+    clearTimeout(fallbackTimeoutId);
+    fallbackTimeoutId = null;
+  }
+}
+
+function setPendingSend(nextPendingSend) {
+  state.pendingSend = nextPendingSend;
+  renderActiveThreadHeader();
+}
+
+function clearPendingSend() {
+  clearPendingSendTimeout();
+  state.pendingSend = null;
+  renderActiveThreadHeader();
+}
+
+function schedulePendingSendReconciliation() {
+  const pendingSend = state.pendingSend;
+  if (!pendingSend) return;
+  void reconcilePendingSend({ ...pendingSend });
+}
+
+function armPendingSendTimeout(threadId) {
+  clearPendingSendTimeout();
+  fallbackTimeoutId = setTimeout(() => {
+    fallbackTimeoutId = null;
+    const pendingSend = getPendingSendForThread(threadId);
+    if (!pendingSend) return;
+    pendingSend.status = 'uncertain';
+    renderActiveThreadHeader();
+    setBanner('等待超时，正在向服务端对账…', 'error');
+    schedulePendingSendReconciliation();
+  }, 5 * 60 * 1000);
+}
+
+function scheduleLoadThreads(delay = 160) {
+  if (threadReloadTimer) {
+    clearTimeout(threadReloadTimer);
+  }
+  threadReloadTimer = setTimeout(() => {
+    threadReloadTimer = null;
+    loadThreads().catch((error) => setBanner(error.message, 'error'));
+  }, delay);
+}
+
+async function recoverClientState(reason = 'reconnect') {
+  if (recoveryPromise) {
+    return recoveryPromise;
+  }
+
+  recoveryPromise = (async () => {
+    addRawEvent('state.recover', {
+      reason,
+      activeThreadId: state.activeThreadId,
+      pendingSend: state.pendingSend
+        ? {
+            threadId: state.pendingSend.threadId,
+            mode: state.pendingSend.mode,
+            status: state.pendingSend.status,
+            realTurnId: state.pendingSend.realTurnId,
+          }
+        : null,
+    });
+
+    await Promise.all([loadHealth(), loadThreads(), loadPendingApprovals()]);
+
+    if (state.activeThreadId) {
+      await refreshThreadFromServer(state.activeThreadId);
+    }
+
+    if (state.pendingSend?.status === 'uncertain') {
+      await reconcilePendingSend({ ...state.pendingSend });
+    }
+  })().finally(() => {
+    recoveryPromise = null;
+  });
+
+  return recoveryPromise;
+}
+
+async function reconcilePendingSend(snapshot = state.pendingSend) {
+  if (!snapshot || !state.pendingSend || state.pendingSend.startedAt !== snapshot.startedAt) {
+    return;
+  }
+
+  const delays = [0, 400, 1000, 2000];
+  for (const delay of delays) {
+    if (delay) {
+      await wait(delay);
+    }
+
+    if (!state.pendingSend || state.pendingSend.startedAt !== snapshot.startedAt) {
+      return;
+    }
+
+    let thread = null;
+    try {
+      thread = await refreshThreadFromServer(snapshot.threadId);
+      await loadPendingApprovals();
+    } catch (error) {
+      addRawEvent('pendingSend.reconcile.error', { message: error.message, threadId: snapshot.threadId });
+      continue;
+    }
+
+    const matchedTurn = findMatchingTurn(thread, snapshot);
+    if (matchedTurn) {
+      state.pendingSend.realTurnId = matchedTurn.id;
+      state.pendingSend.status = matchedTurn.status === 'inProgress' ? 'streaming' : 'completed';
+      renderActiveThreadHeader();
+      if (matchedTurn.status !== 'inProgress') {
+        clearPendingSend();
+      }
+      return;
+    }
+  }
+
+  cleanupOptimisticTurn(snapshot.threadId, snapshot.tempTurnId);
+  cleanupOptimisticMessage(snapshot.threadId, snapshot.realTurnId || snapshot.expectedTurnId, snapshot.tempMessageId);
+  clearPendingSend();
+  setBanner('请求状态未在服务端确认，已回滚本地占位。', 'error');
+}
+
 function upsertThread(thread) {
   if (!thread?.id) return;
   const existing = state.threadMap.get(thread.id) || {};
@@ -268,6 +556,7 @@ function renderThreadList() {
 function renderActiveThreadHeader() {
   const thread = state.currentThread;
   const activeTurnId = deriveActiveTurnId(thread);
+  const pendingSend = thread ? getPendingSendForThread(thread.id) : null;
   if (!thread) {
     el.activeThreadTitle.textContent = '未选择会话';
     el.activeThreadMeta.textContent = '先从左侧选一个会话，或新建一个。';
@@ -289,16 +578,20 @@ function renderActiveThreadHeader() {
   el.interruptTurnBtn.disabled = !activeTurnId;
 
   // 发送按钮：根据发送状态决定
-  if (state.isSending) {
+  if (pendingSend) {
     el.sendMessageBtn.disabled = true;
-    el.sendMessageBtn.textContent = activeTurnId ? '发送中...' : '创建中...';
+    if (pendingSend.status === 'uncertain') {
+      el.sendMessageBtn.textContent = '确认中...';
+    } else {
+      el.sendMessageBtn.textContent = pendingSend.mode === 'start' && !pendingSend.realTurnId ? '创建中...' : '发送中...';
+    }
   } else {
     el.sendMessageBtn.disabled = false;
     el.sendMessageBtn.textContent = '发送';
   }
 
   // 输入框状态：发送中禁用
-  el.composerInput.disabled = state.isSending;
+  el.composerInput.disabled = Boolean(pendingSend);
 }
 
 function renderItem(item) {
@@ -359,6 +652,7 @@ function renderItem(item) {
         `,
       )
       .join('');
+    const output = item.output || '';
     return `
       <article class="message-card diff">
         <div class="message-head">
@@ -369,6 +663,16 @@ function renderItem(item) {
           <summary>查看变更明细</summary>
           <div class="change-list">${changes || '<div class="muted">无改动内容</div>'}</div>
         </details>
+        ${
+          output
+            ? `
+              <details class="inline-details">
+                <summary>查看应用日志</summary>
+                <pre class="code-block">${escapeHtml(output)}</pre>
+              </details>
+            `
+            : ''
+        }
       </article>
     `;
   }
@@ -389,6 +693,9 @@ function renderItem(item) {
 
 function renderConversation() {
   const thread = state.currentThread;
+  const shouldStickToBottom =
+    !el.conversationFeed ||
+    el.conversationFeed.scrollHeight - el.conversationFeed.scrollTop - el.conversationFeed.clientHeight < 48;
   renderActiveThreadHeader();
 
   if (!thread) {
@@ -425,7 +732,9 @@ function renderConversation() {
     })
     .join('');
 
-  el.conversationFeed.scrollTop = el.conversationFeed.scrollHeight;
+  if (shouldStickToBottom) {
+    el.conversationFeed.scrollTop = el.conversationFeed.scrollHeight;
+  }
   renderDiffPreview();
   renderApprovals();
 }
@@ -450,6 +759,7 @@ function renderApprovals() {
       const command = Array.isArray(entry.params?.command) ? entry.params.command.join(' ') : '';
       const reason = entry.params?.reason || (entry.method.includes('fileChange') ? '文件改动需要确认。' : '命令执行需要确认。');
       const available = entry.params?.availableDecisions || ['accept', 'acceptForSession', 'decline', 'cancel'];
+      const inFlightDecision = state.pendingApprovalActions.get(String(entry.requestId));
       const buttons = available
         .filter((value) => ['accept', 'acceptForSession', 'decline', 'cancel'].includes(typeof value === 'string' ? value : ''))
         .map((value) => {
@@ -460,7 +770,9 @@ function renderApprovals() {
             cancel: '取消',
           }[value] || value;
           const klass = value === 'decline' || value === 'cancel' ? 'danger' : 'ghost';
-          return `<button data-request-id="${escapeHtml(entry.requestId)}" data-decision="${escapeHtml(value)}" class="${klass}">${escapeHtml(label)}</button>`;
+          const disabled = inFlightDecision ? 'disabled' : '';
+          const text = inFlightDecision === value ? '处理中...' : label;
+          return `<button data-request-id="${escapeHtml(entry.requestId)}" data-decision="${escapeHtml(value)}" class="${klass}" ${disabled}>${escapeHtml(text)}</button>`;
         })
         .join('');
       return `
@@ -546,15 +858,24 @@ async function loadHealth() {
 async function loadPendingApprovals() {
   const result = await api('/api/approvals/pending');
   state.pendingApprovals.clear();
+  const aliveIds = new Set();
   for (const entry of result.data || []) {
     state.pendingApprovals.set(String(entry.requestId), entry);
+    aliveIds.add(String(entry.requestId));
+  }
+  for (const requestId of [...state.pendingApprovalActions.keys()]) {
+    if (!aliveIds.has(requestId)) {
+      state.pendingApprovalActions.delete(requestId);
+    }
   }
   renderApprovals();
 }
 
 async function loadThreads() {
   state.isLoading = true;
-  el.threadList.innerHTML = '<div class="muted">加载中...</div>';
+  if (!state.threads.length) {
+    el.threadList.innerHTML = '<div class="muted">加载中...</div>';
+  }
   try {
     const result = await api('/api/threads?limit=50&sortKey=updated_at');
     syncThreadsFromList(result.data || []);
@@ -571,7 +892,6 @@ async function refreshThreadFromServer(threadId) {
   upsertThread(result.thread);
   if (state.activeThreadId === threadId) {
     state.currentThread = result.thread;
-    state.activeTurnIdByThread.set(threadId, deriveActiveTurnId(result.thread));
     renderConversation();
   } else {
     renderThreadList();
@@ -638,42 +958,15 @@ async function ensureThreadReadyForTurn(thread) {
   return result.thread;
 }
 
-// 兜底超时 ID，用于在 turn/completed 未收到时恢复状态
-let fallbackTimeoutId = null;
-
 async function sendComposerMessage(event) {
   event.preventDefault();
 
-  // 防御性检查 1: 检查 state.currentThread 是否存在
   if (!state.currentThread?.id) {
     setBanner('请先选择或创建一个会话', 'error');
     return;
   }
 
-  // 检查是否有活跃的 turn（正在进行中的 turn）
-  const currentActiveTurnId = deriveActiveTurnId(state.currentThread);
-
-  // 防御性检查 2: 检查状态一致性
-  // 如果有活跃 turn 且 isSending 为 false，说明状态可能不一致
-  if (currentActiveTurnId && !state.isSending) {
-    console.warn('[sendComposerMessage] 状态不一致：有活跃 turn 但 isSending 为 false', {
-      activeTurnId: currentActiveTurnId,
-      isSending: state.isSending,
-    });
-  }
-
-  // 防御性检查 3: 如果 isSending 为 true，检查是否真的有活跃 turn
-  if (state.isSending && !currentActiveTurnId) {
-    // isSending 为 true 但没有活跃 turn，可能是之前的状态未正确恢复
-    console.warn('[sendComposerMessage] 状态不一致：isSending 为 true 但没有活跃 turn，自动恢复');
-    state.isSending = false;
-    el.sendMessageBtn.disabled = false;
-    el.composerInput.disabled = false;
-    el.sendMessageBtn.textContent = '发送';
-  }
-
-  // 防止重复发送：如果有活跃 turn 且正在发送，不允许
-  if (state.isSending && currentActiveTurnId) {
+  if (getPendingSendForThread(state.currentThread.id)) {
     return;
   }
 
@@ -706,9 +999,8 @@ async function sendComposerMessage(event) {
     content: [{ type: 'text', text }],
   };
 
-  // 记录是否是新 turn（用于后续判断）
   let tempTurnId = null;
-  let isNewTurn = !activeTurnId;
+  const isNewTurn = !activeTurnId;
 
   if (activeTurnId) {
     // Steer 现有 turn：直接添加到现有 turn
@@ -725,38 +1017,24 @@ async function sendComposerMessage(event) {
   // 清空输入框
   el.composerInput.value = '';
 
-  // 设置发送状态（不再在 finally 中恢复，而是在 turn/completed 中恢复）
-  state.isSending = true;
-  el.sendMessageBtn.disabled = true;
-  el.composerInput.disabled = true;
-  el.sendMessageBtn.textContent = isNewTurn ? '创建中...' : '发送中...';
+  const pendingSend = {
+    threadId: thread.id,
+    mode: isNewTurn ? 'start' : 'steer',
+    tempTurnId,
+    realTurnId: isNewTurn ? null : activeTurnId,
+    expectedTurnId: isNewTurn ? null : activeTurnId,
+    tempMessageId,
+    startedAt: Date.now(),
+    status: 'awaitingAck',
+    text,
+  };
+  setPendingSend(pendingSend);
+  armPendingSendTimeout(thread.id);
 
-  // 记录当前发送的线程 ID，用于兜底恢复
-  const sendingThreadId = thread.id;
-
-  // 清除之前的兜底超时（如果有）
-  if (fallbackTimeoutId) {
-    clearTimeout(fallbackTimeoutId);
-  }
-
-  // API 超时控制：60秒
   const controller = new AbortController();
   const apiTimeoutId = setTimeout(() => {
     controller.abort();
   }, 60000);
-
-  // 兜底超时：5分钟后强制恢复状态（防止 turn/completed 事件丢失）
-  fallbackTimeoutId = setTimeout(() => {
-    if (state.isSending) {
-      console.warn('[兜底超时] 5分钟未收到 turn/completed，强制恢复状态');
-      cleanupSendState();
-      setBanner('等待超时，状态已恢复。如需查看结果请刷新。', 'error');
-      // 刷新线程数据
-      if (state.currentThread?.id === sendingThreadId) {
-        refreshThreadFromServer(sendingThreadId).catch(() => {});
-      }
-    }
-  }, 5 * 60 * 1000);
 
   try {
     if (activeTurnId) {
@@ -766,7 +1044,10 @@ async function sendComposerMessage(event) {
         signal: controller.signal,
       });
       addRawEvent('turn.steer', { threadId: thread.id, turnId: activeTurnId, text });
-      // steer 成功后，不恢复状态，等待 turn/completed 事件
+      if (state.pendingSend?.startedAt === pendingSend.startedAt) {
+        state.pendingSend.status = 'streaming';
+        renderActiveThreadHeader();
+      }
     } else {
       const result = await api(`/api/threads/${encodeURIComponent(thread.id)}/turns`, {
         method: 'POST',
@@ -775,61 +1056,67 @@ async function sendComposerMessage(event) {
       });
       const newTurnId = result?.turn?.id;
       if (newTurnId) {
-        // 用真实 turn ID 替换临时 ID
-        const turns = state.currentThread?.turns || [];
-        const tempTurn = turns.find((t) => t.id === tempTurnId);
-        if (tempTurn) {
-          tempTurn.id = newTurnId;
-          state.activeTurnIdByThread.set(thread.id, newTurnId);
-          renderConversation();
+        visitThreadInstances(thread.id, (threadInstance) => {
+          const turns = threadInstance.turns || [];
+          const tempTurn = turns.find((candidate) => candidate.id === tempTurnId);
+          if (tempTurn) {
+            tempTurn.id = newTurnId;
+          }
+        });
+        if (state.pendingSend?.startedAt === pendingSend.startedAt) {
+          state.pendingSend.realTurnId = newTurnId;
+          state.pendingSend.status = 'streaming';
+          renderActiveThreadHeader();
         }
+        renderConversation();
       }
       addRawEvent('turn.start', { threadId: thread.id, text });
-      // 新 turn 创建成功，不恢复状态，等待 turn/completed 事件
     }
-    clearTimeout(apiTimeoutId);
   } catch (error) {
-    clearTimeout(apiTimeoutId);
     if (error.name === 'AbortError') {
-      setBanner('请求超时，请稍后刷新查看结果', 'error');
+      if (state.pendingSend?.startedAt === pendingSend.startedAt) {
+        state.pendingSend.status = 'uncertain';
+        renderActiveThreadHeader();
+      }
+      setBanner('请求超时，正在和服务端对账…', 'error');
+      loadPendingApprovals().catch(() => {});
+      schedulePendingSendReconciliation();
     } else {
       setBanner(`发送失败：${error.message}`, 'error');
-      // 发送失败时清理乐观更新的数据
       if (isNewTurn && tempTurnId) {
         cleanupOptimisticTurn(thread.id, tempTurnId);
       } else if (activeTurnId) {
         cleanupOptimisticMessage(thread.id, activeTurnId, tempMessageId);
       }
+      if (state.pendingSend?.startedAt === pendingSend.startedAt) {
+        clearPendingSend();
+      }
     }
-    // 发送失败时恢复状态并清除兜底超时
-    if (fallbackTimeoutId) {
-      clearTimeout(fallbackTimeoutId);
-      fallbackTimeoutId = null;
-    }
-    cleanupSendState();
+  } finally {
+    clearTimeout(apiTimeoutId);
   }
-  // 注意：成功时不在 finally 中恢复状态，状态在 turn/completed 中恢复
 }
 
 /**
  * 清理发送状态
  */
 function cleanupSendState() {
-  state.isSending = false;
-  el.sendMessageBtn.disabled = false;
-  el.composerInput.disabled = false;
-  el.sendMessageBtn.textContent = '发送';
+  clearPendingSend();
 }
 
 /**
  * 清理乐观更新的临时 turn
  */
 function cleanupOptimisticTurn(threadId, tempTurnId) {
-  if (state.currentThread?.id !== threadId) return;
-  const turns = state.currentThread.turns || [];
-  const index = turns.findIndex((t) => t.id === tempTurnId);
-  if (index !== -1) {
-    turns.splice(index, 1);
+  if (!threadId || !tempTurnId) return;
+  visitThreadInstances(threadId, (thread) => {
+    const turns = thread.turns || [];
+    const index = turns.findIndex((candidate) => candidate.id === tempTurnId);
+    if (index !== -1) {
+      turns.splice(index, 1);
+    }
+  });
+  if (state.currentThread?.id === threadId) {
     renderConversation();
   }
 }
@@ -838,14 +1125,17 @@ function cleanupOptimisticTurn(threadId, tempTurnId) {
  * 清理乐观更新的临时消息
  */
 function cleanupOptimisticMessage(threadId, turnId, tempMessageId) {
-  const thread = state.currentThread;
-  if (!thread || thread.id !== threadId) return;
-  const turn = (thread.turns || []).find((t) => t.id === turnId);
-  if (!turn) return;
-  const items = turn.items || [];
-  const index = items.findIndex((item) => item.id === tempMessageId);
-  if (index !== -1) {
-    items.splice(index, 1);
+  if (!threadId || !turnId || !tempMessageId) return;
+  visitThreadInstances(threadId, (thread) => {
+    const turn = (thread.turns || []).find((candidate) => candidate.id === turnId);
+    if (!turn) return;
+    const items = turn.items || [];
+    const index = items.findIndex((item) => item.id === tempMessageId);
+    if (index !== -1) {
+      items.splice(index, 1);
+    }
+  });
+  if (state.currentThread?.id === threadId) {
     renderConversation();
   }
 }
@@ -868,31 +1158,39 @@ async function interruptCurrentTurn() {
 }
 
 function mergeItemIntoTurn(threadId, turnId, incomingItem) {
-  const thread = state.currentThread && state.currentThread.id === threadId ? state.currentThread : null;
-  if (!thread) return;
-  const turn = (thread.turns || []).find((candidate) => candidate.id === turnId);
-  if (!turn) return;
+  if (!threadId || !turnId || !incomingItem) return;
+  visitThreadInstances(threadId, (thread) => {
+    const turn = findTurnForUpdate(thread, threadId, turnId);
+    if (!turn) return;
 
-  const items = turn.items || (turn.items = []);
-  const existing = items.find((candidate) => candidate.id === incomingItem.id);
-  if (!existing) {
-    items.push(incomingItem);
-  } else {
-    Object.assign(existing, incomingItem);
-  }
+    const items = turn.items || (turn.items = []);
+    let existing = items.find((candidate) => candidate.id === incomingItem.id);
+    if (!existing && incomingItem.type === 'userMessage') {
+      existing = findOptimisticUserMessage(items, incomingItem);
+      if (existing) {
+        existing.id = incomingItem.id;
+      }
+    }
+    if (!existing) {
+      items.push(incomingItem);
+    } else {
+      Object.assign(existing, incomingItem);
+    }
+  });
 }
 
 function appendDeltaToItem(threadId, turnId, itemId, delta, targetField = 'text') {
-  const thread = state.currentThread && state.currentThread.id === threadId ? state.currentThread : null;
-  if (!thread) return;
-  const turn = (thread.turns || []).find((candidate) => candidate.id === turnId);
-  if (!turn) return;
-  const item = (turn.items || []).find((candidate) => candidate.id === itemId);
-  if (!item) return;
-  item[targetField] = (item[targetField] || '') + delta;
-  if (targetField === 'aggregatedOutput') {
-    item.aggregatedOutput = item[targetField];
-  }
+  if (!threadId || !turnId || !itemId) return;
+  visitThreadInstances(threadId, (thread) => {
+    const turn = findTurnForUpdate(thread, threadId, turnId);
+    if (!turn) return;
+    const item = (turn.items || []).find((candidate) => candidate.id === itemId);
+    if (!item) return;
+    item[targetField] = (item[targetField] || '') + delta;
+    if (targetField === 'aggregatedOutput') {
+      item.aggregatedOutput = item[targetField];
+    }
+  });
 }
 
 function handleJsonRpc(msg) {
@@ -913,7 +1211,7 @@ function handleJsonRpc(msg) {
     case 'thread/started': {
       if (msg.params?.thread) {
         upsertThread(msg.params.thread);
-        loadThreads().catch((error) => setBanner(error.message, 'error'));
+        scheduleLoadThreads();
       }
       break;
     }
@@ -924,87 +1222,50 @@ function handleJsonRpc(msg) {
         state.currentThread.status = msg.params.status;
         renderConversation();
       }
-      loadThreads().catch(() => {});
+      scheduleLoadThreads();
       break;
     }
     case 'turn/started': {
       const turn = msg.params?.turn;
-      if (turn?.threadId && state.currentThread?.id === turn.threadId) {
-        const turns = state.currentThread.turns || (state.currentThread.turns = []);
-        const exists = turns.find((candidate) => candidate.id === turn.id);
-        if (!exists) {
-          // 检查是否有临时 turn 需要替换
-          const tempTurn = turns.find((t) => t.id?.toString().startsWith('temp-turn-'));
-          if (tempTurn) {
-            // 替换临时 turn
-            tempTurn.id = turn.id;
-            Object.assign(tempTurn, turn);
-            if (!tempTurn.items) tempTurn.items = [];
-          } else {
-            turns.push({ ...turn, items: [] });
-          }
+      if (turn?.threadId) {
+        upsertTurnInState(turn.threadId, { ...turn, items: Array.isArray(turn.items) ? turn.items : [] }, { allowPendingReplacement: true });
+        const pendingSend = getPendingSendForThread(turn.threadId);
+        if (pendingSend?.tempTurnId) {
+          pendingSend.realTurnId = turn.id;
+          pendingSend.status = 'streaming';
+          renderActiveThreadHeader();
         }
-        renderConversation();
+        if (state.currentThread?.id === turn.threadId) {
+          renderConversation();
+        }
       }
       break;
     }
     case 'turn/completed': {
       const turn = msg.params?.turn;
-      console.log('[turn/completed] 收到事件:', { turn, currentThreadId: state.currentThread?.id, isSending: state.isSending });
+      const threadId = turn?.threadId ?? msg.params?.threadId;
+      console.log('[turn/completed] 收到事件:', { turn, threadId, currentThreadId: state.currentThread?.id, pendingSend: state.pendingSend });
 
-      if (turn) {
-        const threadId = msg.params?.threadId;  // threadId 在 params 中，不在 turn 中
-        const isCurrentThread = state.currentThread?.id === threadId;
-
-        console.log('[turn/completed] 检查条件:', { threadId, isCurrentThread });
-
-        // 关键修复：总是更新 turn 状态，无论是否当前线程
-        // 先从 threadMap 中查找并更新
-        const thread = state.threadMap.get(threadId);
-        if (thread?.turns) {
-          const existing = thread.turns.find((candidate) => candidate.id === turn.id);
-          if (existing) {
-            existing.status = turn.status || 'completed';
-            if (turn.items) existing.items = turn.items;
-          } else {
-            console.warn('[turn/completed] 在 threadMap 中未找到 turn:', turn.id);
-          }
+      if (!turn || !threadId) {
+        if (state.activeThreadId) {
+          refreshThreadFromServer(state.activeThreadId).catch(() => {});
         }
-
-        // 再更新 currentThread（如果匹配）
-        if (isCurrentThread && state.currentThread?.turns) {
-          const existing = state.currentThread.turns.find((candidate) => candidate.id === turn.id);
-          if (existing) {
-            existing.status = turn.status || 'completed';
-            if (turn.items) existing.items = turn.items;
-          } else {
-            console.warn('[turn/completed] 在 currentThread 中未找到 turn:', turn.id);
-          }
-        }
-
-        // 清除活跃 turn
-        if (threadId) {
-          state.activeTurnIdByThread.delete(threadId);
-        }
-
-        // 恢复发送状态
-        if (state.isSending) {
-          console.log('[turn/completed] 恢复发送状态');
-          // 清除兜底超时
-          if (fallbackTimeoutId) {
-            clearTimeout(fallbackTimeoutId);
-            fallbackTimeoutId = null;
-          }
-          state.isSending = false;
-          el.sendMessageBtn.disabled = false;
-          el.composerInput.disabled = false;
-          el.sendMessageBtn.textContent = '发送';
-        }
-
-        renderConversation();
-        renderActiveThreadHeader();
-        loadThreads().catch(() => {});
+        break;
       }
+
+      upsertTurnInState(threadId, turn, { allowPendingReplacement: true });
+
+      const pendingSend = getPendingSendForThread(threadId);
+      const currentThread = state.currentThread?.id === threadId ? state.currentThread : null;
+      const remainingActiveTurnId = currentThread ? deriveActiveTurnId(currentThread) : null;
+      if (pendingSend && (matchesPendingSendTurn(pendingSend, turn) || !remainingActiveTurnId)) {
+        clearPendingSend();
+      }
+
+      if (currentThread) {
+        renderConversation();
+      }
+      scheduleLoadThreads();
       break;
     }
     case 'turn/diff/updated': {
@@ -1068,7 +1329,11 @@ function handleJsonRpc(msg) {
     case 'serverRequest/resolved': {
       if (msg.params?.requestId) {
         state.pendingApprovals.delete(String(msg.params.requestId));
+        state.pendingApprovalActions.delete(String(msg.params.requestId));
         renderApprovals();
+        if (msg.params?.threadId && state.currentThread?.id === msg.params.threadId) {
+          refreshThreadFromServer(msg.params.threadId).catch(() => {});
+        }
       }
       break;
     }
@@ -1097,16 +1362,16 @@ function connectEvents() {
       state.sse = null;
     }
 
-    const source = new EventSource('/api/events');
+    const sourceUrl = state.lastEventSeq ? `/api/events?lastEventId=${encodeURIComponent(state.lastEventSeq)}` : '/api/events';
+    const source = new EventSource(sourceUrl);
     state.sse = source;
 
     source.onopen = () => {
-      reconnectAttempts = 0; // 重置重连计数
+      reconnectAttempts = 0;
       if (isReconnect) {
         setBanner('SSE 已重新连接');
         addRawEvent('sse.reconnect', { timestamp: new Date().toISOString() });
-        // 重连后刷新数据，确保状态同步
-        Promise.all([loadHealth(), loadThreads()]).catch(() => {});
+        recoverClientState('reconnect').catch((error) => setBanner(error.message, 'error'));
       }
     };
 
@@ -1118,6 +1383,22 @@ function connectEvents() {
         console.error('[SSE] JSON 解析失败:', parseError, event.data);
         addRawEvent('parseError', { error: parseError.message, raw: event.data });
         return;
+      }
+      const seq = Number(payload.seq || 0);
+      if (seq) {
+        if (seq <= state.lastEventSeq) {
+          return;
+        }
+        if (state.lastEventSeq && seq > state.lastEventSeq + 1) {
+          addRawEvent('sse.gap', {
+            expected: state.lastEventSeq + 1,
+            received: seq,
+          });
+          state.lastEventSeq = seq;
+          recoverClientState('event-gap').catch((error) => setBanner(error.message, 'error'));
+          return;
+        }
+        state.lastEventSeq = seq;
       }
       if (payload.type === 'connection') {
         state.health = payload.payload;
@@ -1249,13 +1530,21 @@ async function initialize() {
     if (!button) return;
     const requestId = button.dataset.requestId;
     const decision = button.dataset.decision;
+    if (state.pendingApprovalActions.has(requestId)) return;
+    state.pendingApprovalActions.set(requestId, decision);
+    renderApprovals();
     try {
       await api(`/api/approvals/${encodeURIComponent(requestId)}`, {
         method: 'POST',
         body: JSON.stringify({ decision }),
       });
+      state.pendingApprovals.delete(requestId);
+      state.pendingApprovalActions.delete(requestId);
+      renderApprovals();
       addRawEvent('approval.response', { requestId, decision });
     } catch (error) {
+      state.pendingApprovalActions.delete(requestId);
+      renderApprovals();
       setBanner(`审批回包失败：${error.message}`, 'error');
     }
   });

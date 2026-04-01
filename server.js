@@ -399,6 +399,7 @@ class MockCodexBridge extends BaseBridge {
     this.mode = options.mode || 'mock';
     this.threads = new Map();
     this.pendingSimulations = new Map();
+    this.sessionApprovalPolicies = new Map();
     this.health = {
       ...this.health,
       mode: this.mode,
@@ -464,6 +465,7 @@ class MockCodexBridge extends BaseBridge {
               id: fileItemId,
               type: 'fileChange',
               status: 'completed',
+              output: 'Applied patch to src/auth/login.ts\n',
               changes: [
                 {
                   path: 'src/auth/login.ts',
@@ -509,7 +511,25 @@ class MockCodexBridge extends BaseBridge {
     this._emitEvent('jsonrpc', { method, params });
   }
 
+  _approvalPolicyKey(method, params = {}) {
+    return `${params.threadId || 'global'}:${method}`;
+  }
+
   _registerServerRequest(method, params) {
+    const policy = this.sessionApprovalPolicies.get(this._approvalPolicyKey(method, params));
+    if (policy === 'accept') {
+      setTimeout(() => {
+        if (method === 'item/commandExecution/requestApproval') {
+          this._continueAfterCommandApproval(params.threadId, params.turnId, 'accept');
+          return;
+        }
+        if (method === 'item/fileChange/requestApproval') {
+          this._continueAfterFileApproval(params.threadId, params.turnId, 'accept');
+        }
+      }, 0);
+      return null;
+    }
+
     const rawId = Math.floor(Math.random() * 1_000_000_000);
     const requestId = String(rawId);
     const entry = {
@@ -739,6 +759,7 @@ class MockCodexBridge extends BaseBridge {
       id: scenario.fileItemId,
       type: 'fileChange',
       status: 'inProgress',
+      output: '',
       changes: [
         {
           path: 'src/auth/login.ts',
@@ -817,6 +838,7 @@ class MockCodexBridge extends BaseBridge {
     }
 
     fileItem.status = 'completed';
+    fileItem.output = `${fileItem.output || ''}Applied patch to src/auth/login.ts\n`;
     this._emitNotification('item/fileChange/outputDelta', { threadId, turnId, itemId: fileItem.id, delta: 'Applied patch to src/auth/login.ts\n' });
     this._emitNotification('item/completed', { threadId, turnId, item: deepClone(fileItem) });
     this._finishTurn(threadId, turnId, 'completed', ' I ran the tests, prepared the patch, and it is ready for you to review.');
@@ -884,7 +906,11 @@ class MockCodexBridge extends BaseBridge {
     }
     this.pendingServerRequests.delete(String(requestId));
     this._emitNotification('serverRequest/resolved', { threadId: entry.params.threadId, requestId: entry.requestId });
-    const decision = typeof payload.decision === 'string' ? payload.decision : (payload.decision && payload.decision.acceptWithExecpolicyAmendment ? 'accept' : 'accept');
+    let decision = typeof payload.decision === 'string' ? payload.decision : (payload.decision && payload.decision.acceptWithExecpolicyAmendment ? 'accept' : 'accept');
+    if (decision === 'acceptForSession') {
+      this.sessionApprovalPolicies.set(this._approvalPolicyKey(entry.method, entry.params), 'accept');
+      decision = 'accept';
+    }
     if (entry.method === 'item/commandExecution/requestApproval') {
       this._continueAfterCommandApproval(entry.params.threadId, entry.params.turnId, decision);
     } else if (entry.method === 'item/fileChange/requestApproval') {
@@ -917,8 +943,18 @@ async function createBridge() {
 }
 
 function serveStatic(req, res, pathname) {
-  let filePath = pathname === '/' ? path.join(PUBLIC_DIR, 'index.html') : path.join(PUBLIC_DIR, pathname.replace(/^\//, ''));
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  let decodedPath = pathname;
+  try {
+    decodedPath = decodeURIComponent(pathname);
+  } catch {
+    text(res, 400, 'Bad request');
+    return;
+  }
+
+  const relativePath = decodedPath === '/' ? 'index.html' : decodedPath.replace(/^\/+/, '');
+  const filePath = path.resolve(PUBLIC_DIR, relativePath);
+  const indexPath = path.join(PUBLIC_DIR, 'index.html');
+  if (!(filePath === indexPath || filePath.startsWith(`${PUBLIC_DIR}${path.sep}`))) {
     text(res, 403, 'Forbidden');
     return;
   }
@@ -997,7 +1033,12 @@ function serveStatic(req, res, pathname) {
         });
         res.write('retry: 3000\n\n');
         sseClients.add(res);
-        for (const event of recentEvents.slice(-40)) {
+        const rawLastEventId = req.headers['last-event-id'] || url.searchParams.get('lastEventId');
+        const lastEventId = Number(rawLastEventId);
+        const replayEvents = Number.isFinite(lastEventId) && lastEventId > 0
+          ? recentEvents.filter((event) => event.seq > lastEventId)
+          : recentEvents.slice(-40);
+        for (const event of replayEvents) {
           sendSse(res, event);
         }
         req.on('close', () => sseClients.delete(res));
