@@ -922,28 +922,38 @@ function handleJsonRpc(msg) {
       const turn = msg.params?.turn;
       console.log('[turn/completed] 收到事件:', { turn, currentThreadId: state.currentThread?.id, isSending: state.isSending });
 
-      // 放宽条件：只要有 turn 数据就处理
       if (turn) {
         const threadId = turn.threadId;
         const isCurrentThread = state.currentThread?.id === threadId;
 
         console.log('[turn/completed] 检查条件:', { threadId, isCurrentThread });
 
-        if (isCurrentThread && threadId) {
-          const turns = state.currentThread.turns || (state.currentThread.turns = []);
-          const existing = turns.find((candidate) => candidate.id === turn.id);
+        // 关键修复：总是更新 turn 状态，无论是否当前线程
+        // 先从 threadMap 中查找并更新
+        const thread = state.threadMap.get(threadId);
+        if (thread?.turns) {
+          const existing = thread.turns.find((candidate) => candidate.id === turn.id);
           if (existing) {
             existing.status = turn.status || 'completed';
             if (turn.items) existing.items = turn.items;
-          } else {
-            turns.push({ ...turn, status: turn.status || 'completed' });
           }
+        }
 
-          // 清除 activeTurnId
+        // 再更新 currentThread（如果匹配）
+        if (isCurrentThread && state.currentThread?.turns) {
+          const existing = state.currentThread.turns.find((candidate) => candidate.id === turn.id);
+          if (existing) {
+            existing.status = turn.status || 'completed';
+            if (turn.items) existing.items = turn.items;
+          }
+        }
+
+        // 清除活跃 turn
+        if (threadId) {
           state.activeTurnIdByThread.delete(threadId);
         }
 
-        // 简化条件：只要正在发送且这个 turn 存在，就恢复状态
+        // 恢复发送状态
         if (state.isSending) {
           console.log('[turn/completed] 恢复发送状态');
           // 清除兜底超时
@@ -957,12 +967,13 @@ function handleJsonRpc(msg) {
           el.sendMessageBtn.textContent = '发送';
         }
 
-        if (isCurrentThread) {
-          renderConversation();
+        renderConversation();
+        renderActiveThreadHeader();
+        loadThreads().catch(() => {});
+        if (threadId) {
           refreshThreadFromServer(threadId).catch(() => {});
         }
       }
-      loadThreads().catch(() => {});
       break;
     }
     case 'turn/diff/updated': {
