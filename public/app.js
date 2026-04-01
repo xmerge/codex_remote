@@ -278,7 +278,7 @@ function renderActiveThreadHeader() {
   el.reloadThreadBtn.disabled = false;
   el.interruptTurnBtn.disabled = !activeTurnId;
   el.sendMessageBtn.disabled = false;
-  el.sendMessageBtn.textContent = activeTurnId ? 'Steer 当前 Turn' : '发送';
+  el.sendMessageBtn.textContent = '发送';
   state.activeTurnIdByThread.set(thread.id, activeTurnId || null);
 }
 
@@ -640,6 +640,31 @@ async function sendComposerMessage(event) {
   }
 
   const activeTurnId = deriveActiveTurnId(thread);
+
+  // 乐观更新：先创建用户消息并渲染
+  const tempMessageId = `temp-user-${Date.now()}`;
+  const userMessage = {
+    id: tempMessageId,
+    type: 'userMessage',
+    content: [{ type: 'text', text }],
+  };
+
+  if (activeTurnId) {
+    // Steer 现有 turn：直接添加到现有 turn
+    mergeItemIntoTurn(thread.id, activeTurnId, userMessage);
+    renderConversation();
+  } else {
+    // 新 turn：先创建临时 turn
+    const tempTurnId = `temp-turn-${Date.now()}`;
+    const turns = state.currentThread?.turns || (state.currentThread.turns = []);
+    turns.push({ id: tempTurnId, threadId: thread.id, status: 'inProgress', items: [userMessage] });
+    state.activeTurnIdByThread.set(thread.id, tempTurnId);
+    renderConversation();
+  }
+
+  // 清空输入框
+  el.composerInput.value = '';
+
   state.isSending = true;
   el.sendMessageBtn.disabled = true;
   el.composerInput.disabled = true;
@@ -650,14 +675,6 @@ async function sendComposerMessage(event) {
         method: 'POST',
         body: JSON.stringify({ text }),
       });
-      // 乐观更新：立即添加用户消息到现有 turn
-      const userMessage = {
-        id: `temp-user-${Date.now()}`,
-        type: 'userMessage',
-        content: [{ type: 'text', text }],
-      };
-      mergeItemIntoTurn(thread.id, activeTurnId, userMessage);
-      renderConversation();
       addRawEvent('turn.steer', { threadId: thread.id, turnId: activeTurnId, text });
     } else {
       const result = await api(`/api/threads/${encodeURIComponent(thread.id)}/turns`, {
@@ -666,27 +683,20 @@ async function sendComposerMessage(event) {
       });
       const newTurnId = result?.turn?.id;
       if (newTurnId) {
-        // 确保新 turn 存在于本地状态
-        const turns = state.currentThread?.turns || (state.currentThread.turns = []);
-        const existingTurn = turns.find((t) => t.id === newTurnId);
-        if (!existingTurn) {
-          turns.push({ id: newTurnId, threadId: thread.id, status: 'inProgress', items: [] });
+        // 用真实 turn ID 替换临时 ID
+        const turns = state.currentThread?.turns || [];
+        const tempTurn = turns.find((t) => t.id.startsWith('temp-turn-'));
+        if (tempTurn) {
+          tempTurn.id = newTurnId;
+          state.activeTurnIdByThread.set(thread.id, newTurnId);
+          renderConversation();
         }
-        state.activeTurnIdByThread.set(thread.id, newTurnId);
-        // 乐观更新：立即添加用户消息到新 turn
-        const userMessage = {
-          id: `temp-user-${Date.now()}`,
-          type: 'userMessage',
-          content: [{ type: 'text', text }],
-        };
-        mergeItemIntoTurn(thread.id, newTurnId, userMessage);
-        renderConversation();
       }
       addRawEvent('turn.start', { threadId: thread.id, text });
     }
-    el.composerInput.value = '';
   } catch (error) {
     setBanner(`发送失败：${error.message}`, 'error');
+    // 保留用户消息，但可以选择移除临时 turn
   } finally {
     state.isSending = false;
     el.sendMessageBtn.disabled = false;
