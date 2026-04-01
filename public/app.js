@@ -822,7 +822,17 @@ function handleJsonRpc(msg) {
         } else {
           turns.push(turn);
         }
+        // 确保 turn 状态为 completed
+        if (existing) {
+          existing.status = 'completed';
+        }
+        // 清除 activeTurnIdByThread 中的记录
         state.activeTurnIdByThread.delete(turn.threadId);
+        // 恢复发送状态
+        state.isSending = false;
+        el.sendMessageBtn.disabled = false;
+        el.composerInput.disabled = false;
+        el.sendMessageBtn.textContent = '发送';
         renderConversation();
         refreshThreadFromServer(turn.threadId).catch(() => {});
       }
