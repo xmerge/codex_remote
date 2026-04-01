@@ -633,6 +633,9 @@ async function ensureThreadReadyForTurn(thread) {
   return result.thread;
 }
 
+// 兜底超时 ID，用于在 turn/completed 未收到时恢复状态
+let fallbackTimeoutId = null;
+
 async function sendComposerMessage(event) {
   event.preventDefault();
 
@@ -698,14 +701,32 @@ async function sendComposerMessage(event) {
   el.composerInput.disabled = true;
   el.sendMessageBtn.textContent = isNewTurn ? '创建中...' : '发送中...';
 
-  // 超时控制：60秒后清理状态（延长超时时间）
+  // 记录当前发送的线程 ID，用于兜底恢复
+  const sendingThreadId = thread.id;
+
+  // 清除之前的兜底超时（如果有）
+  if (fallbackTimeoutId) {
+    clearTimeout(fallbackTimeoutId);
+  }
+
+  // API 超时控制：60秒
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => {
+  const apiTimeoutId = setTimeout(() => {
     controller.abort();
-    // 超时时清理状态
-    cleanupSendState();
-    setBanner('请求超时，状态已恢复', 'error');
   }, 60000);
+
+  // 兜底超时：5分钟后强制恢复状态（防止 turn/completed 事件丢失）
+  fallbackTimeoutId = setTimeout(() => {
+    if (state.isSending) {
+      console.warn('[兜底超时] 5分钟未收到 turn/completed，强制恢复状态');
+      cleanupSendState();
+      setBanner('等待超时，状态已恢复。如需查看结果请刷新。', 'error');
+      // 刷新线程数据
+      if (state.currentThread?.id === sendingThreadId) {
+        refreshThreadFromServer(sendingThreadId).catch(() => {});
+      }
+    }
+  }, 5 * 60 * 1000);
 
   try {
     if (activeTurnId) {
@@ -729,17 +750,18 @@ async function sendComposerMessage(event) {
         const tempTurn = turns.find((t) => t.id === tempTurnId);
         if (tempTurn) {
           tempTurn.id = newTurnId;
+          state.activeTurnIdByThread.set(thread.id, newTurnId);
           renderConversation();
         }
       }
       addRawEvent('turn.start', { threadId: thread.id, text });
       // 新 turn 创建成功，不恢复状态，等待 turn/completed 事件
     }
-    clearTimeout(timeoutId);
+    clearTimeout(apiTimeoutId);
   } catch (error) {
-    clearTimeout(timeoutId);
+    clearTimeout(apiTimeoutId);
     if (error.name === 'AbortError') {
-      // 超时导致的 abort，已在 timeout 回调中处理
+      setBanner('请求超时，请稍后刷新查看结果', 'error');
     } else {
       setBanner(`发送失败：${error.message}`, 'error');
       // 发送失败时清理乐观更新的数据
@@ -749,7 +771,11 @@ async function sendComposerMessage(event) {
         cleanupOptimisticMessage(thread.id, activeTurnId, tempMessageId);
       }
     }
-    // 发送失败时恢复状态
+    // 发送失败时恢复状态并清除兜底超时
+    if (fallbackTimeoutId) {
+      clearTimeout(fallbackTimeoutId);
+      fallbackTimeoutId = null;
+    }
     cleanupSendState();
   }
   // 注意：成功时不在 finally 中恢复状态，状态在 turn/completed 中恢复
@@ -894,28 +920,47 @@ function handleJsonRpc(msg) {
     }
     case 'turn/completed': {
       const turn = msg.params?.turn;
-      if (turn?.threadId && state.currentThread?.id === turn.threadId) {
-        const turns = state.currentThread.turns || (state.currentThread.turns = []);
-        const existing = turns.find((candidate) => candidate.id === turn.id);
-        if (existing) {
-          // 只更新必要字段，不覆盖 status
-          existing.status = 'completed';
-          if (turn.items) existing.items = turn.items;
-        } else {
-          turns.push({ ...turn, status: 'completed' });
+      console.log('[turn/completed] 收到事件:', { turn, currentThreadId: state.currentThread?.id, isSending: state.isSending });
+
+      // 放宽条件：只要有 turn 数据就处理
+      if (turn) {
+        const threadId = turn.threadId;
+        const isCurrentThread = state.currentThread?.id === threadId;
+
+        console.log('[turn/completed] 检查条件:', { threadId, isCurrentThread });
+
+        if (isCurrentThread && threadId) {
+          const turns = state.currentThread.turns || (state.currentThread.turns = []);
+          const existing = turns.find((candidate) => candidate.id === turn.id);
+          if (existing) {
+            existing.status = turn.status || 'completed';
+            if (turn.items) existing.items = turn.items;
+          } else {
+            turns.push({ ...turn, status: turn.status || 'completed' });
+          }
+
+          // 清除 activeTurnId
+          state.activeTurnIdByThread.delete(threadId);
         }
 
-        // 清除 activeTurnId
-        state.activeTurnIdByThread.delete(turn.threadId);
+        // 简化条件：只要正在发送且这个 turn 存在，就恢复状态
+        if (state.isSending) {
+          console.log('[turn/completed] 恢复发送状态');
+          // 清除兜底超时
+          if (fallbackTimeoutId) {
+            clearTimeout(fallbackTimeoutId);
+            fallbackTimeoutId = null;
+          }
+          state.isSending = false;
+          el.sendMessageBtn.disabled = false;
+          el.composerInput.disabled = false;
+          el.sendMessageBtn.textContent = '发送';
+        }
 
-        // 直接恢复发送状态（不需要检查 remainingActiveTurn）
-        state.isSending = false;
-        el.sendMessageBtn.disabled = false;
-        el.composerInput.disabled = false;
-        el.sendMessageBtn.textContent = '发送';
-
-        renderConversation();
-        refreshThreadFromServer(turn.threadId).catch(() => {});
+        if (isCurrentThread) {
+          renderConversation();
+          refreshThreadFromServer(threadId).catch(() => {});
+        }
       }
       loadThreads().catch(() => {});
       break;
