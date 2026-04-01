@@ -9,6 +9,16 @@ const crypto = require('crypto');
 const PORT = Number(process.env.PORT || 8788);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_RECENT_EVENTS = 400;
+const AUTH_COOKIE_NAME = 'codex_remote_auth';
+const AUTH_SCRYPT_SALT = process.env.ACCESS_KEY_SALT || 'codex-remote-web-mvp';
+const CONFIGURED_ACCESS_KEY = process.env.ACCESS_KEY || process.env.APP_ACCESS_KEY || '';
+const GENERATED_ACCESS_KEY = CONFIGURED_ACCESS_KEY ? '' : crypto.randomBytes(18).toString('base64url');
+const EFFECTIVE_ACCESS_KEY = CONFIGURED_ACCESS_KEY || GENERATED_ACCESS_KEY;
+const EXPECTED_ACCESS_KEY_HASH = process.env.ACCESS_KEY_HASH || crypto.scryptSync(EFFECTIVE_ACCESS_KEY, AUTH_SCRYPT_SALT, 64).toString('hex');
+const SESSION_SECRET = process.env.SESSION_SECRET || `${EFFECTIVE_ACCESS_KEY}:session`;
+const SESSION_KEY = crypto.createHash('sha256').update(SESSION_SECRET).digest();
+const AUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 12;
+const AUTH_ENABLED = process.env.DISABLE_AUTH === '1' ? false : true;
 
 function nowUnix() {
   return Math.floor(Date.now() / 1000);
@@ -31,6 +41,97 @@ function text(res, statusCode, body, contentType = 'text/plain; charset=utf-8') 
     'Cache-Control': 'no-store',
   });
   res.end(body);
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value).toString('base64url');
+}
+
+function base64UrlDecode(value) {
+  return Buffer.from(value, 'base64url');
+}
+
+function parseCookies(req) {
+  const header = req.headers.cookie || '';
+  const pairs = header.split(/;\s*/).filter(Boolean);
+  const cookies = {};
+  for (const pair of pairs) {
+    const index = pair.indexOf('=');
+    if (index === -1) continue;
+    const key = pair.slice(0, index);
+    const rawValue = pair.slice(index + 1);
+    cookies[key] = rawValue;
+  }
+  return cookies;
+}
+
+function encryptSession(payload) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', SESSION_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${base64UrlEncode(iv)}.${base64UrlEncode(encrypted)}.${base64UrlEncode(tag)}`;
+}
+
+function decryptSession(token) {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const iv = base64UrlDecode(parts[0]);
+    const encrypted = base64UrlDecode(parts[1]);
+    const tag = base64UrlDecode(parts[2]);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', SESSION_KEY, iv);
+    decipher.setAuthTag(tag);
+    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+    const payload = JSON.parse(decrypted);
+    if (!payload?.exp || payload.exp < Date.now()) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function makeSessionCookie(token, expiresAt) {
+  const expires = new Date(expiresAt).toUTCString();
+  return `${AUTH_COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Strict; Expires=${expires}`;
+}
+
+function clearSessionCookie() {
+  return `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+}
+
+function getAuthState(req) {
+  if (!AUTH_ENABLED) {
+    return { required: false, authenticated: true, session: null };
+  }
+  const cookies = parseCookies(req);
+  const session = decryptSession(cookies[AUTH_COOKIE_NAME]);
+  return {
+    required: true,
+    authenticated: Boolean(session),
+    session,
+  };
+}
+
+function isAuthorized(req) {
+  return getAuthState(req).authenticated;
+}
+
+function verifyAccessKey(input) {
+  if (!AUTH_ENABLED) return true;
+  if (typeof input !== 'string' || !input) return false;
+  const actualHash = crypto.scryptSync(input, AUTH_SCRYPT_SALT, 64).toString('hex');
+  const expected = Buffer.from(EXPECTED_ACCESS_KEY_HASH, 'hex');
+  const actual = Buffer.from(actualHash, 'hex');
+  if (expected.length !== actual.length) return false;
+  return crypto.timingSafeEqual(expected, actual);
+}
+
+function unauthorized(res) {
+  return json(res, 401, { error: 'Unauthorized' });
 }
 
 function safeJsonParse(line) {
@@ -1021,6 +1122,30 @@ function serveStatic(req, res, pathname) {
       const url = new URL(req.url, `http://${req.headers.host}`);
       const { pathname } = url;
 
+      if (req.method === 'GET' && pathname === '/api/auth/status') {
+        return json(res, 200, getAuthState(req));
+      }
+
+      if (req.method === 'POST' && pathname === '/api/auth/login') {
+        const body = await readJsonBody(req);
+        if (!verifyAccessKey(body.key)) {
+          return json(res, 401, { error: '密钥错误' });
+        }
+        const expiresAt = Date.now() + AUTH_SESSION_TTL_MS;
+        const token = encryptSession({ exp: expiresAt });
+        res.setHeader('Set-Cookie', makeSessionCookie(token, expiresAt));
+        return json(res, 200, { ok: true, authenticated: true, required: AUTH_ENABLED });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/auth/logout') {
+        res.setHeader('Set-Cookie', clearSessionCookie());
+        return json(res, 200, { ok: true });
+      }
+
+      if (pathname.startsWith('/api/') && !isAuthorized(req)) {
+        return unauthorized(res);
+      }
+
       if (req.method === 'GET' && pathname === '/api/health') {
         return json(res, 200, bridge.getHealth());
       }
@@ -1136,5 +1261,16 @@ function serveStatic(req, res, pathname) {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Codex Remote Web MVP listening on http://localhost:${PORT}`);
+    if (AUTH_ENABLED) {
+      if (CONFIGURED_ACCESS_KEY) {
+        console.log('Auth enabled with configured ACCESS_KEY.');
+      } else if (process.env.ACCESS_KEY_HASH) {
+        console.log('Auth enabled with ACCESS_KEY_HASH.');
+      } else {
+        console.log(`Auth enabled with generated ACCESS_KEY: ${EFFECTIVE_ACCESS_KEY}`);
+      }
+    } else {
+      console.log('Auth disabled via DISABLE_AUTH=1.');
+    }
   });
 })();

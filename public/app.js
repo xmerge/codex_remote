@@ -12,8 +12,14 @@ const state = {
   lastEventSeq: 0,
   pendingSend: null,
   isLoading: false,
+  appBootstrapped: false,
   utilityTab: 'approvals',
   utilityTrayOpen: false,
+  auth: {
+    required: true,
+    authenticated: false,
+    ready: false,
+  },
 };
 
 const el = {};
@@ -53,6 +59,15 @@ function previewText(value, limit = 140) {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
   if (!text) return '';
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+function shortPath(value) {
+  if (!value) return '—';
+  const normalized = String(value).replace(/\\/g, '/');
+  const parts = normalized.split('/').filter(Boolean);
+  if (!parts.length) return normalized;
+  if (parts.length <= 4) return normalized;
+  return `.../${parts.slice(-3).join('/')}`;
 }
 
 function normalizeApprovalPolicy(value) {
@@ -130,7 +145,17 @@ async function api(path, options = {}) {
   const text = await response.text();
   const payload = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(payload.error || response.statusText);
+    const error = new Error(payload.error || response.statusText);
+    error.status = response.status;
+    if (response.status === 401 && !path.startsWith('/api/auth/')) {
+      state.auth.required = true;
+      state.auth.authenticated = false;
+      state.auth.ready = true;
+      disconnectLiveUpdates();
+      state.appBootstrapped = false;
+      renderAuthGate(payload.error || '鉴权已失效，请重新输入访问密钥。');
+    }
+    throw error;
   }
   return payload;
 }
@@ -182,6 +207,63 @@ function setUtilityTab(tab) {
 function setUtilityTrayOpen(open) {
   state.utilityTrayOpen = open;
   renderUtilityTray();
+}
+
+function disconnectLiveUpdates() {
+  if (state.sse) {
+    state.sse.close();
+    state.sse = null;
+  }
+}
+
+function renderAuthGate(message = '') {
+  if (!el.authGate) return;
+  const shouldShow = state.auth.required && !state.auth.authenticated;
+  el.authGate.classList.toggle('is-hidden', !shouldShow);
+  if (el.logoutBtn) {
+    el.logoutBtn.hidden = shouldShow || !state.auth.required;
+  }
+  if (el.authMessage) {
+    el.authMessage.textContent = message || (shouldShow ? '请输入密钥后继续。' : '已通过鉴权。');
+    el.authMessage.className = `status-banner ${message && shouldShow ? 'error' : 'muted'}`.trim();
+  }
+  if (shouldShow) {
+    requestAnimationFrame(() => el.authKeyInput?.focus());
+  }
+}
+
+async function loadAuthStatus() {
+  const auth = await api('/api/auth/status');
+  state.auth = {
+    required: Boolean(auth.required),
+    authenticated: Boolean(auth.authenticated),
+    ready: true,
+  };
+  renderAuthGate();
+  return auth;
+}
+
+async function bootstrapAuthenticatedApp({ forceReload = false } = {}) {
+  if (!state.auth.authenticated) return;
+  if (!state.appBootstrapped) {
+    connectEvents();
+    state.appBootstrapped = true;
+  }
+
+  if (forceReload) {
+    state.lastEventSeq = 0;
+  }
+
+  state.isLoading = true;
+  setBanner('正在同步会话数据...');
+  try {
+    await Promise.all([loadHealth(), loadPendingApprovals(), loadThreads()]);
+    renderConversation();
+    renderEventLog();
+    renderUtilityTray();
+  } finally {
+    state.isLoading = false;
+  }
 }
 
 function renderHealth() {
@@ -547,6 +629,7 @@ function renderThreadList() {
     button.classList.toggle('active', thread.id === state.activeThreadId);
     fragment.querySelector('.thread-item-title').textContent = deriveThreadTitle(thread);
     fragment.querySelector('.thread-item-preview').textContent = thread.preview || '暂无预览';
+    fragment.querySelector('.thread-item-path').textContent = `cwd: ${shortPath(thread.cwd)}`;
     const status = thread.status?.type || 'unknown';
     fragment.querySelector('.thread-item-meta').textContent = `${fmtCompactTime(thread.updatedAt)} · ${status}`;
     el.threadList.appendChild(fragment);
@@ -560,6 +643,7 @@ function renderActiveThreadHeader() {
   if (!thread) {
     el.activeThreadTitle.textContent = '未选择会话';
     el.activeThreadMeta.textContent = '先从左侧选一个会话，或新建一个。';
+    if (el.activeThreadPath) el.activeThreadPath.textContent = 'cwd: —';
     el.resumeThreadBtn.disabled = true;
     el.reloadThreadBtn.disabled = true;
     el.interruptTurnBtn.disabled = true;
@@ -571,6 +655,10 @@ function renderActiveThreadHeader() {
   const status = thread.status?.type || 'unknown';
   el.activeThreadTitle.textContent = deriveThreadTitle(thread);
   el.activeThreadMeta.textContent = `${status} · 更新于 ${fmtTime(thread.updatedAt)} · 线程 ${shortId(thread.id)}`;
+  if (el.activeThreadPath) {
+    el.activeThreadPath.textContent = `cwd: ${thread.cwd || '—'}`;
+    el.activeThreadPath.title = thread.cwd || '—';
+  }
   el.resumeThreadBtn.disabled = false;
   el.reloadThreadBtn.disabled = false;
 
@@ -739,6 +827,11 @@ function renderConversation() {
   renderApprovals();
 }
 
+function scrollConversationToBottom() {
+  if (!el.conversationFeed) return;
+  el.conversationFeed.scrollTop = el.conversationFeed.scrollHeight;
+}
+
 function renderApprovals() {
   const activeThreadId = state.activeThreadId;
   const approvals = [...state.pendingApprovals.values()].filter((entry) => !activeThreadId || entry.params?.threadId === activeThreadId);
@@ -903,6 +996,7 @@ async function openThread(threadId, { silent = false } = {}) {
   state.activeThreadId = threadId;
   renderThreadList();
   const thread = await refreshThreadFromServer(threadId);
+  scrollConversationToBottom();
   if (!silent) {
     setBanner(`已打开 ${deriveThreadTitle(thread)}`);
   }
@@ -1348,6 +1442,9 @@ function handleJsonRpc(msg) {
 }
 
 function connectEvents() {
+  if (!state.auth.authenticated) {
+    return;
+  }
   // 重连相关变量
   let reconnectAttempts = 0;
   const maxReconnectDelay = 30000;
@@ -1355,6 +1452,9 @@ function connectEvents() {
   let reconnectTimer = null;
 
   const connect = () => {
+    if (!state.auth.authenticated) {
+      return;
+    }
     const isReconnect = reconnectAttempts > 0;
 
     if (state.sse) {
@@ -1437,6 +1537,9 @@ function connectEvents() {
       setBanner(`SSE 连接断开，${Math.round(delay / 1000)}秒后重连...`, 'error');
 
       reconnectTimer = setTimeout(() => {
+        if (!state.auth.authenticated) {
+          return;
+        }
         addRawEvent('sse.reconnecting', { attempt: reconnectAttempts, delay });
         connect();
       }, delay);
@@ -1448,6 +1551,12 @@ function connectEvents() {
 
 async function initialize() {
   Object.assign(el, {
+    authGate: qs('authGate'),
+    authForm: qs('authForm'),
+    authKeyInput: qs('authKeyInput'),
+    authMessage: qs('authMessage'),
+    authSubmitBtn: qs('authSubmitBtn'),
+    logoutBtn: qs('logoutBtn'),
     healthPanel: qs('healthPanel'),
     statusBanner: qs('statusBanner'),
     refreshHealthBtn: qs('refreshHealthBtn'),
@@ -1455,6 +1564,7 @@ async function initialize() {
     threadList: qs('threadList'),
     activeThreadTitle: qs('activeThreadTitle'),
     activeThreadMeta: qs('activeThreadMeta'),
+    activeThreadPath: qs('activeThreadPath'),
     resumeThreadBtn: qs('resumeThreadBtn'),
     reloadThreadBtn: qs('reloadThreadBtn'),
     interruptTurnBtn: qs('interruptTurnBtn'),
@@ -1498,6 +1608,56 @@ async function initialize() {
   el.interruptTurnBtn.addEventListener('click', () => interruptCurrentTurn());
   el.composerForm.addEventListener('submit', sendComposerMessage);
   el.newThreadBtn.addEventListener('click', () => createThreadFromForm().catch((error) => setBanner(`创建失败：${error.message}`, 'error')));
+  el.authForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const key = el.authKeyInput.value.trim();
+    if (!key) {
+      renderAuthGate('请输入访问密钥。');
+      return;
+    }
+    el.authSubmitBtn.disabled = true;
+    try {
+      await api('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ key }),
+      });
+      el.authKeyInput.value = '';
+      await loadAuthStatus();
+      await bootstrapAuthenticatedApp({ forceReload: true });
+      renderAuthGate();
+    } catch (error) {
+      renderAuthGate(error.message || '登录失败');
+    } finally {
+      el.authSubmitBtn.disabled = false;
+    }
+  });
+  el.logoutBtn.addEventListener('click', async () => {
+    try {
+      await api('/api/auth/logout', { method: 'POST', body: '{}' });
+    } catch {
+      // Ignore logout failures and reset locally.
+    }
+    disconnectLiveUpdates();
+    state.appBootstrapped = false;
+    state.auth.authenticated = false;
+    state.auth.ready = true;
+    state.health = null;
+    state.threads = [];
+    state.threadMap.clear();
+    state.activeThreadId = null;
+    state.currentThread = null;
+    state.pendingApprovals.clear();
+    state.latestDiffByTurn.clear();
+    state.pendingSend = null;
+    state.rawEvents = [];
+    renderHealth();
+    renderThreadList();
+    renderConversation();
+    renderApprovals();
+    renderDiffPreview();
+    renderEventLog();
+    renderAuthGate('已退出，请重新输入访问密钥。');
+  });
   el.clearEventsBtn.addEventListener('click', () => {
     state.rawEvents = [];
     renderEventLog();
@@ -1550,16 +1710,15 @@ async function initialize() {
   });
 
   renderUtilityTray();
-  connectEvents();
-  state.isLoading = true;
-  setBanner('正在初始化...');
+  renderAuthGate();
+  setBanner('正在检查访问权限...');
   try {
-    await Promise.all([loadHealth(), loadPendingApprovals(), loadThreads()]);
-    renderConversation();
-    renderEventLog();
-    renderUtilityTray();
-  } finally {
-    state.isLoading = false;
+    await loadAuthStatus();
+    if (state.auth.authenticated) {
+      await bootstrapAuthenticatedApp({ forceReload: true });
+    }
+  } catch (error) {
+    renderAuthGate(error.message || '初始化失败');
   }
 }
 

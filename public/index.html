@@ -8,65 +8,98 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <div id="authGate" class="auth-gate is-hidden">
+      <div class="auth-card">
+        <div class="auth-copy">
+          <span class="eyebrow">Secure Access</span>
+          <h2>输入访问密钥</h2>
+          <p>会话数据和事件流在服务端受保护，只有通过鉴权后才会建立连接。</p>
+        </div>
+        <form id="authForm" class="auth-form">
+          <label>
+            <span>访问密钥</span>
+            <input id="authKeyInput" type="password" autocomplete="current-password" placeholder="请输入访问密钥" />
+          </label>
+          <div id="authMessage" class="status-banner muted">请输入密钥后继续。</div>
+          <button id="authSubmitBtn" type="submit" class="primary">解锁访问</button>
+        </form>
+      </div>
+    </div>
+
     <div class="app-shell">
       <aside class="sidebar">
-        <div class="brandbar">
-          <div class="brand-copy">
-            <span class="eyebrow">Codex Remote</span>
-            <h1>Remote Console</h1>
-            <p>会话、对话和审批都放在一个真正可用的控制台里。</p>
+        <div class="sidebar-top">
+          <div class="brandbar">
+            <div class="brand-copy">
+              <span class="eyebrow">Codex Remote</span>
+              <h1>Remote Console</h1>
+              <p>会话优先，工具按需展开。</p>
+            </div>
+            <button id="logoutBtn" class="ghost subtle" type="button">退出</button>
           </div>
+
+          <section class="card compact sidebar-card connection-card">
+            <div class="section-head">
+              <div>
+                <strong>连接状态</strong>
+                <span>本地 daemon / app-server</span>
+              </div>
+              <button id="refreshHealthBtn" class="ghost">刷新</button>
+            </div>
+            <div id="healthPanel" class="health-grid"></div>
+            <div id="statusBanner" class="status-banner muted">等待连接…</div>
+          </section>
+
+          <details class="card compact sidebar-card new-thread-card">
+            <summary class="new-thread-summary">
+              <div class="new-thread-summary-copy">
+                <strong>新会话</strong>
+                <span>按需展开创建</span>
+              </div>
+              <span class="new-thread-summary-action">展开</span>
+            </summary>
+            <div class="new-thread-body">
+              <div class="form-grid">
+                <label>
+                  <span>模型</span>
+                  <select id="newThreadModel">
+                    <option value="gpt-5.4">gpt-5.4</option>
+                    <option value="gpt-5.4-mini">gpt-5.4-mini</option>
+                    <option value="gpt-5.3-codex">gpt-5.3-codex</option>
+                    <option value="gpt-5.2">gpt-5.2</option>
+                    <option value="gpt-5.2-codex">gpt-5.2-codex</option>
+                    <option value="gpt-5.1-codex-max">gpt-5.1-codex-max</option>
+                  </select>
+                </label>
+                <label class="span-two">
+                  <span>工作目录</span>
+                  <input id="newThreadCwd" type="text" placeholder="/Users/me/project" spellcheck="false" />
+                </label>
+                <label>
+                  <span>审批</span>
+                  <select id="newThreadApprovalPolicy">
+                    <option value="untrusted">untrusted</option>
+                    <option value="on-request">on-request</option>
+                    <option value="on-failure">on-failure</option>
+                    <option value="granular">granular</option>
+                    <option value="never">never</option>
+                  </select>
+                </label>
+                <label>
+                  <span>沙箱</span>
+                  <select id="newThreadSandboxType">
+                    <option value="workspaceWrite">workspaceWrite</option>
+                    <option value="readOnly">readOnly</option>
+                    <option value="dangerFullAccess">dangerFullAccess</option>
+                  </select>
+                </label>
+              </div>
+              <div class="new-thread-actions">
+                <button id="newThreadBtn" class="primary" type="button">新建会话</button>
+              </div>
+            </div>
+          </details>
         </div>
-
-        <section class="card compact sidebar-card">
-          <div class="section-head">
-            <div>
-              <strong>连接</strong>
-              <span>本地 daemon / app-server</span>
-            </div>
-            <button id="refreshHealthBtn" class="ghost">刷新</button>
-          </div>
-          <div id="healthPanel" class="health-grid"></div>
-          <div id="statusBanner" class="status-banner muted">等待连接…</div>
-        </section>
-
-        <section class="card compact sidebar-card">
-          <div class="section-head">
-            <div>
-              <strong>新会话</strong>
-              <span>快速创建</span>
-            </div>
-            <button id="newThreadBtn" class="primary">新建</button>
-          </div>
-          <div class="form-grid">
-            <label>
-              <span>模型</span>
-              <input id="newThreadModel" type="text" value="gpt-5.4" placeholder="gpt-5.4" />
-            </label>
-            <label class="span-two">
-              <span>工作目录</span>
-              <input id="newThreadCwd" type="text" placeholder="/Users/me/project" />
-            </label>
-            <label>
-              <span>审批</span>
-              <select id="newThreadApprovalPolicy">
-                <option value="untrusted">untrusted</option>
-                <option value="on-request">on-request</option>
-                <option value="on-failure">on-failure</option>
-                <option value="granular">granular</option>
-                <option value="never">never</option>
-              </select>
-            </label>
-            <label>
-              <span>沙箱</span>
-              <select id="newThreadSandboxType">
-                <option value="workspaceWrite">workspaceWrite</option>
-                <option value="readOnly">readOnly</option>
-                <option value="dangerFullAccess">dangerFullAccess</option>
-              </select>
-            </label>
-          </div>
-        </section>
 
         <section class="card compact sidebar-card thread-pane">
           <div class="section-head">
@@ -81,11 +114,11 @@
       </aside>
 
       <main class="main">
-        <header class="card compact main-header">
+        <header class="card compact main-header thread-summary-card">
           <div class="thread-header-copy">
-            <span class="eyebrow">Active Thread</span>
-            <h2 id="activeThreadTitle">未选择会话</h2>
-            <p id="activeThreadMeta" class="muted">先从左侧选一个会话，或新建一个。</p>
+            <span id="activeThreadTitle" class="thread-title-inline">未选择会话</span>
+            <span id="activeThreadMeta" class="thread-meta-inline muted">先从左侧选一个会话，或新建一个。</span>
+            <div id="activeThreadPath" class="path-pill muted">cwd: —</div>
           </div>
           <div class="row gap-wrap">
             <button id="resumeThreadBtn" class="ghost" disabled>恢复</button>
@@ -148,6 +181,7 @@
       <button class="thread-item">
         <div class="thread-item-title"></div>
         <div class="thread-item-preview"></div>
+        <div class="thread-item-path"></div>
         <div class="thread-item-meta"></div>
       </button>
     </template>
