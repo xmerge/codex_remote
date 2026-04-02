@@ -2,7 +2,7 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const readline = require('readline');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const { EventEmitter } = require('events');
 const crypto = require('crypto');
 
@@ -194,6 +194,72 @@ function normalizeApprovalPolicy(value) {
     onRequest: 'on-request',
   };
   return mapping[value] || value || 'untrusted';
+}
+
+function execFileAsync(command, args) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { timeout: 120000 }, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function pickDirectoryNative(startPath) {
+  const normalizedStartPath =
+    typeof startPath === 'string' && startPath.trim() && fs.existsSync(startPath.trim()) ? startPath.trim() : '';
+
+  try {
+    if (process.platform === 'darwin') {
+      const script = normalizedStartPath
+        ? [
+            `set defaultFolder to POSIX file ${JSON.stringify(normalizedStartPath)}`,
+            'set selectedFolder to choose folder with prompt "选择工作目录" default location defaultFolder',
+            'return POSIX path of selectedFolder',
+          ]
+        : ['set selectedFolder to choose folder with prompt "选择工作目录"', 'return POSIX path of selectedFolder'];
+      const { stdout } = await execFileAsync('/usr/bin/osascript', script.flatMap((line) => ['-e', line]));
+      const selected = String(stdout || '').trim();
+      return { cancelled: false, path: selected || '' };
+    }
+
+    if (process.platform === 'win32') {
+      const script = `
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = '选择工作目录'
+${normalizedStartPath ? `$dialog.SelectedPath = ${JSON.stringify(normalizedStartPath)}` : ''}
+$result = $dialog.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }
+`;
+      const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-Command', script]);
+      const selected = String(stdout || '').trim();
+      return { cancelled: !selected, path: selected || '' };
+    }
+
+    const args = ['--file-selection', '--directory', '--title=选择工作目录'];
+    if (normalizedStartPath) {
+      args.push(`--filename=${normalizedStartPath.endsWith(path.sep) ? normalizedStartPath : `${normalizedStartPath}${path.sep}`}`);
+    }
+    const { stdout } = await execFileAsync('zenity', args);
+    const selected = String(stdout || '').trim();
+    return { cancelled: false, path: selected || '' };
+  } catch (error) {
+    const cancelled =
+      error?.killed ||
+      error?.code === 1 ||
+      /user canceled|cancelled|canceled/i.test(error?.message || '') ||
+      /execution error: User canceled/i.test(error?.stderr || '');
+    if (cancelled) {
+      return { cancelled: true, path: '' };
+    }
+    throw error;
+  }
 }
 
 async function withAutoResume(bridge, threadId, operation) {
@@ -529,6 +595,7 @@ class MockCodexBridge extends BaseBridge {
       preview: 'Review the login failure and propose a fix',
       name: 'Sample mock thread',
       ephemeral: false,
+      model: 'gpt-5.4',
       modelProvider: 'openai',
       createdAt,
       updatedAt: createdAt + 60,
@@ -1186,6 +1253,12 @@ function serveStatic(req, res, pathname) {
       if (req.method === 'GET' && threadReadMatch) {
         const threadId = decodeURIComponent(threadReadMatch[1]);
         const result = await bridge.readThread(threadId, { includeTurns: true });
+        return json(res, 200, result);
+      }
+
+      if (req.method === 'POST' && pathname === '/api/system/pick-directory') {
+        const body = await readJsonBody(req);
+        const result = await pickDirectoryNative(body.startPath);
         return json(res, 200, result);
       }
 

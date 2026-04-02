@@ -24,6 +24,7 @@ const state = {
 };
 
 const el = {};
+const AVAILABLE_MODELS = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.2', 'gpt-5.2-codex', 'gpt-5.1-codex-max'];
 
 function qs(id) {
   return document.getElementById(id);
@@ -77,6 +78,20 @@ function normalizeApprovalPolicy(value) {
     onRequest: 'on-request',
   };
   return mapping[value] || value || 'untrusted';
+}
+
+function deriveThreadModel(thread) {
+  if (!thread) return '';
+  return (
+    thread.model ||
+    thread.modelName ||
+    thread.currentModel ||
+    thread.configuration?.model ||
+    thread.config?.model ||
+    thread.metadata?.model ||
+    thread.session?.model ||
+    ''
+  );
 }
 
 function isImageLikePart(part) {
@@ -144,10 +159,19 @@ async function api(path, options = {}) {
   });
 
   const text = await response.text();
-  const payload = text ? JSON.parse(text) : {};
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { rawText: text };
+    }
+  }
   if (!response.ok) {
-    const error = new Error(payload.error || response.statusText);
+    const fallbackMessage = typeof payload.rawText === 'string' && payload.rawText.trim() ? payload.rawText.trim() : response.statusText;
+    const error = new Error(payload.error || fallbackMessage);
     error.status = response.status;
+    error.rawText = payload.rawText || '';
     if (response.status === 401 && !path.startsWith('/api/auth/')) {
       state.auth.required = true;
       state.auth.authenticated = false;
@@ -229,6 +253,70 @@ function closeSidebar() {
   toggleSidebar(false);
 }
 
+function setMobileThreadDetailsOpen(open) {
+  if (!el.mobileThreadDetailsModal) return;
+  el.mobileThreadDetailsModal.classList.toggle('is-visible', open);
+  el.mobileThreadDetailsModal.classList.toggle('is-hidden', !open);
+  el.mobileThreadDetailsModal.setAttribute('aria-hidden', open ? 'false' : 'true');
+}
+
+function renderMobileThreadDetails() {
+  if (!el.mobileThreadDetailsList) return;
+  const thread = state.currentThread;
+  if (el.mobileThreadInfoBtn) {
+    el.mobileThreadInfoBtn.disabled = !thread;
+  }
+  if (el.mobileThreadModelSelect) {
+    el.mobileThreadModelSelect.disabled = !thread;
+  }
+  if (el.mobileThreadModelApplyBtn) {
+    el.mobileThreadModelApplyBtn.disabled = !thread;
+    el.mobileThreadModelApplyBtn.textContent = '应用';
+  }
+  if (!thread) {
+    el.mobileThreadDetailsList.innerHTML = '<div class="mobile-thread-detail-row"><div class="label">状态</div><div class="value">当前还没有打开的会话。</div></div>';
+    if (el.mobileThreadModelSelect) {
+      el.mobileThreadModelSelect.value = AVAILABLE_MODELS[0];
+    }
+    return;
+  }
+
+  const model = deriveThreadModel(thread);
+  if (el.mobileThreadModelSelect) {
+    const hasOption = model && [...el.mobileThreadModelSelect.options].some((option) => option.value === model);
+    if (model && !hasOption) {
+      const option = document.createElement('option');
+      option.value = model;
+      option.textContent = model;
+      el.mobileThreadModelSelect.appendChild(option);
+    }
+    el.mobileThreadModelSelect.value = model || AVAILABLE_MODELS[0];
+  }
+
+  const rows = [
+    ['标题', deriveThreadTitle(thread)],
+    ['线程 ID', thread.id || '—'],
+    ['状态', thread.status?.type || 'unknown'],
+    ['模型', model || '—'],
+    ['工作目录', thread.cwd || '—'],
+    ['审批策略', thread.approvalPolicy || '—'],
+    ['沙箱', thread.sandboxPolicy?.type || thread.sandboxPolicy || '—'],
+    ['更新时间', fmtTime(thread.updatedAt)],
+    ['创建时间', fmtTime(thread.createdAt)],
+  ];
+
+  el.mobileThreadDetailsList.innerHTML = rows
+    .map(
+      ([label, value]) => `
+        <div class="mobile-thread-detail-row">
+          <div class="label">${escapeHtml(label)}</div>
+          <div class="value">${escapeHtml(String(value || '—'))}</div>
+        </div>
+      `,
+    )
+    .join('');
+}
+
 function renderMobileHeader() {
   if (!el.mobileThreadTitle) return;
   const thread = state.currentThread;
@@ -237,6 +325,7 @@ function renderMobileHeader() {
   } else {
     el.mobileThreadTitle.textContent = 'Codex Remote';
   }
+  renderMobileThreadDetails();
 }
 
 function disconnectLiveUpdates() {
@@ -645,6 +734,9 @@ function syncThreadsFromList(threads) {
 
 function renderThreadList() {
   const list = state.threads;
+  if (el.threadCountBadge) {
+    el.threadCountBadge.textContent = String(list.length);
+  }
   if (!list.length) {
     el.threadList.innerHTML = '<div class="muted">还没有会话。</div>';
     return;
@@ -1062,11 +1154,50 @@ async function createThreadFromForm() {
     });
     await loadThreads();
     await openThread(result.thread.id);
+    setNewThreadPanelOpen(false);
     closeSidebar(); // 创建会话后关闭侧边栏
   } finally {
     el.newThreadBtn.disabled = false;
     el.newThreadBtn.textContent = '新建会话';
     state.isLoading = false;
+  }
+}
+
+function setNewThreadPanelOpen(open) {
+  if (!el.newThreadPanel) return;
+  el.newThreadPanel.classList.toggle('is-hidden', !open);
+  if (el.toggleNewThreadPanelBtn) {
+    el.toggleNewThreadPanelBtn.textContent = open ? '收起' : '新会话';
+  }
+  if (open) {
+    requestAnimationFrame(() => el.newThreadCwd?.focus());
+  }
+}
+
+async function pickWorkingDirectory() {
+  if (!el.pickNewThreadCwdBtn) return;
+  const currentLabel = el.pickNewThreadCwdBtn.textContent;
+  el.pickNewThreadCwdBtn.disabled = true;
+  el.pickNewThreadCwdBtn.textContent = '选择中...';
+  try {
+    const result = await api('/api/system/pick-directory', {
+      method: 'POST',
+      body: JSON.stringify({ startPath: el.newThreadCwd?.value?.trim() || undefined }),
+    });
+    if (result.cancelled || !result.path) {
+      return;
+    }
+    el.newThreadCwd.value = result.path;
+    el.newThreadCwd.focus();
+  } catch (error) {
+    if (error.status === 404) {
+      setBanner('目录选择不可用：当前服务端版本过旧，请重启 `npm start` 后再试。', 'error');
+    } else {
+      setBanner(`目录选择失败：${error.message}`, 'error');
+    }
+  } finally {
+    el.pickNewThreadCwdBtn.disabled = false;
+    el.pickNewThreadCwdBtn.textContent = currentLabel;
   }
 }
 
@@ -1616,8 +1747,13 @@ async function initialize() {
     newThreadBtn: qs('newThreadBtn'),
     newThreadModel: qs('newThreadModel'),
     newThreadCwd: qs('newThreadCwd'),
+    pickNewThreadCwdBtn: qs('pickNewThreadCwdBtn'),
     newThreadApprovalPolicy: qs('newThreadApprovalPolicy'),
     newThreadSandboxType: qs('newThreadSandboxType'),
+    newThreadPanel: qs('newThreadPanel'),
+    toggleNewThreadPanelBtn: qs('toggleNewThreadPanelBtn'),
+    closeNewThreadPanelBtn: qs('closeNewThreadPanelBtn'),
+    threadCountBadge: qs('threadCountBadge'),
     utilityTray: qs('utilityTray'),
     toggleUtilityBtn: qs('toggleUtilityBtn'),
     utilityTabApprovals: qs('utilityTabApprovals'),
@@ -1631,7 +1767,12 @@ async function initialize() {
     sidebarOverlay: qs('sidebarOverlay'),
     menuToggle: qs('menuToggle'),
     mobileThreadTitle: qs('mobileThreadTitle'),
-    mobileNewThreadBtn: qs('mobileNewThreadBtn'),
+    mobileThreadInfoBtn: qs('mobileThreadInfoBtn'),
+    mobileThreadDetailsModal: qs('mobileThreadDetailsModal'),
+    mobileThreadDetailsCloseBtn: qs('mobileThreadDetailsCloseBtn'),
+    mobileThreadDetailsList: qs('mobileThreadDetailsList'),
+    mobileThreadModelSelect: qs('mobileThreadModelSelect'),
+    mobileThreadModelApplyBtn: qs('mobileThreadModelApplyBtn'),
   });
 
   el.refreshHealthBtn.addEventListener('click', () => loadHealth().catch((error) => setBanner(error.message, 'error')));
@@ -1649,6 +1790,18 @@ async function initialize() {
   el.interruptTurnBtn.addEventListener('click', () => interruptCurrentTurn());
   el.composerForm.addEventListener('submit', sendComposerMessage);
   el.newThreadBtn.addEventListener('click', () => createThreadFromForm().catch((error) => setBanner(`创建失败：${error.message}`, 'error')));
+  if (el.pickNewThreadCwdBtn) {
+    el.pickNewThreadCwdBtn.addEventListener('click', () => pickWorkingDirectory());
+  }
+  if (el.toggleNewThreadPanelBtn) {
+    el.toggleNewThreadPanelBtn.addEventListener('click', () => {
+      const isHidden = el.newThreadPanel?.classList.contains('is-hidden');
+      setNewThreadPanelOpen(Boolean(isHidden));
+    });
+  }
+  if (el.closeNewThreadPanelBtn) {
+    el.closeNewThreadPanelBtn.addEventListener('click', () => setNewThreadPanelOpen(false));
+  }
   el.authForm.addEventListener('submit', async (event) => {
     event.preventDefault();
     const key = el.authKeyInput.value.trim();
@@ -1733,16 +1886,43 @@ async function initialize() {
   if (el.sidebarOverlay) {
     el.sidebarOverlay.addEventListener('click', () => closeSidebar());
   }
-  if (el.mobileNewThreadBtn) {
-    el.mobileNewThreadBtn.addEventListener('click', async () => {
-      closeSidebar();
-      // 展开新建会话面板
-      const newThreadCard = document.querySelector('.new-thread-card');
-      if (newThreadCard && !newThreadCard.open) {
-        newThreadCard.open = true;
+  if (el.mobileThreadInfoBtn) {
+    el.mobileThreadInfoBtn.addEventListener('click', () => {
+      renderMobileThreadDetails();
+      setMobileThreadDetailsOpen(true);
+    });
+  }
+  if (el.mobileThreadDetailsCloseBtn) {
+    el.mobileThreadDetailsCloseBtn.addEventListener('click', () => setMobileThreadDetailsOpen(false));
+  }
+  if (el.mobileThreadDetailsModal) {
+    el.mobileThreadDetailsModal.addEventListener('click', (event) => {
+      if (event.target === el.mobileThreadDetailsModal) {
+        setMobileThreadDetailsOpen(false);
       }
-      // 聚焦到工作目录输入框
-      el.newThreadCwd?.focus();
+    });
+  }
+  if (el.mobileThreadModelApplyBtn) {
+    el.mobileThreadModelApplyBtn.addEventListener('click', async () => {
+      const thread = state.currentThread;
+      const model = el.mobileThreadModelSelect?.value?.trim();
+      if (!thread?.id || !model) return;
+      el.mobileThreadModelApplyBtn.disabled = true;
+      el.mobileThreadModelApplyBtn.textContent = '应用中...';
+      try {
+        await api(`/api/threads/${encodeURIComponent(thread.id)}/resume`, {
+          method: 'POST',
+          body: JSON.stringify({ model }),
+        });
+        await refreshThreadFromServer(thread.id);
+        renderMobileThreadDetails();
+        setBanner(`已切换模型为 ${model}`);
+      } catch (error) {
+        setBanner(`模型切换失败：${error.message}`, 'error');
+      } finally {
+        el.mobileThreadModelApplyBtn.disabled = false;
+        el.mobileThreadModelApplyBtn.textContent = '应用';
+      }
     });
   }
 
