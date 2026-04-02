@@ -1215,7 +1215,9 @@ code {
   }
 
   .main {
+    padding: 0.35rem;
     padding-top: 0;
+    gap: 0.35rem;
     min-height: 0;
   }
 
@@ -1243,11 +1245,13 @@ code {
   .conversation-stage {
     padding-top: 0;
     min-height: 0;
+    gap: 0.35rem;
   }
 
   .conversation-feed {
     flex: 1 1 auto;
     min-height: 0;
+    padding: 0.35rem;
   }
 
   .utility-tray:not(.is-collapsed) {
