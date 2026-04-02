@@ -15,6 +15,7 @@ const state = {
   appBootstrapped: false,
   utilityTab: 'approvals',
   utilityTrayOpen: false,
+  sidebarOpen: false,
   auth: {
     required: true,
     authenticated: false,
@@ -207,6 +208,35 @@ function setUtilityTab(tab) {
 function setUtilityTrayOpen(open) {
   state.utilityTrayOpen = open;
   renderUtilityTray();
+}
+
+function toggleSidebar(open) {
+  state.sidebarOpen = typeof open === 'boolean' ? open : !state.sidebarOpen;
+  if (el.sidebar) {
+    el.sidebar.classList.toggle('is-open', state.sidebarOpen);
+  }
+  if (el.sidebarOverlay) {
+    el.sidebarOverlay.classList.toggle('is-visible', state.sidebarOpen);
+  }
+  if (state.sidebarOpen) {
+    document.body.style.overflow = 'hidden';
+  } else {
+    document.body.style.overflow = '';
+  }
+}
+
+function closeSidebar() {
+  toggleSidebar(false);
+}
+
+function renderMobileHeader() {
+  if (!el.mobileThreadTitle) return;
+  const thread = state.currentThread;
+  if (thread) {
+    el.mobileThreadTitle.textContent = deriveThreadTitle(thread);
+  } else {
+    el.mobileThreadTitle.textContent = 'Codex Remote';
+  }
 }
 
 function disconnectLiveUpdates() {
@@ -649,6 +679,7 @@ function renderActiveThreadHeader() {
     el.interruptTurnBtn.disabled = true;
     el.sendMessageBtn.disabled = true;
     el.sendMessageBtn.textContent = '发送';
+    renderMobileHeader();
     return;
   }
 
@@ -680,6 +711,9 @@ function renderActiveThreadHeader() {
 
   // 输入框状态：发送中禁用
   el.composerInput.disabled = Boolean(pendingSend);
+
+  // 更新移动端标题
+  renderMobileHeader();
 }
 
 function renderItem(item) {
@@ -1028,6 +1062,7 @@ async function createThreadFromForm() {
     });
     await loadThreads();
     await openThread(result.thread.id);
+    closeSidebar(); // 创建会话后关闭侧边栏
   } finally {
     el.newThreadBtn.disabled = false;
     el.newThreadBtn.textContent = '新建会话';
@@ -1591,6 +1626,12 @@ async function initialize() {
     utilityPanelApprovals: qs('utilityPanelApprovals'),
     utilityPanelDiff: qs('utilityPanelDiff'),
     utilityPanelEvents: qs('utilityPanelEvents'),
+    // 移动端元素
+    sidebar: document.querySelector('.sidebar'),
+    sidebarOverlay: qs('sidebarOverlay'),
+    menuToggle: qs('menuToggle'),
+    mobileThreadTitle: qs('mobileThreadTitle'),
+    mobileNewThreadBtn: qs('mobileNewThreadBtn'),
   });
 
   el.refreshHealthBtn.addEventListener('click', () => loadHealth().catch((error) => setBanner(error.message, 'error')));
@@ -1681,8 +1722,29 @@ async function initialize() {
     const button = event.target.closest('.thread-item');
     if (button?.dataset.threadId) {
       openThread(button.dataset.threadId);
+      closeSidebar(); // 移动端选择会话后关闭侧边栏
     }
   });
+
+  // 移动端菜单交互
+  if (el.menuToggle) {
+    el.menuToggle.addEventListener('click', () => toggleSidebar());
+  }
+  if (el.sidebarOverlay) {
+    el.sidebarOverlay.addEventListener('click', () => closeSidebar());
+  }
+  if (el.mobileNewThreadBtn) {
+    el.mobileNewThreadBtn.addEventListener('click', async () => {
+      closeSidebar();
+      // 展开新建会话面板
+      const newThreadCard = document.querySelector('.new-thread-card');
+      if (newThreadCard && !newThreadCard.open) {
+        newThreadCard.open = true;
+      }
+      // 聚焦到工作目录输入框
+      el.newThreadCwd?.focus();
+    });
+  }
 
   // 事件委托：审批按钮点击
   el.approvalList.addEventListener('click', async (event) => {
