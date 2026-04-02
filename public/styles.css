@@ -1215,11 +1215,13 @@ code {
   }
 
   .main {
+    height: 100%;
     padding: 0.35rem;
     padding-top: 0;
     padding-bottom: calc(0.35rem + env(safe-area-inset-bottom, 0px));
     gap: 0.35rem;
     min-height: 0;
+    overflow: hidden;
   }
 
   .main-header,
@@ -1246,6 +1248,7 @@ code {
   .conversation-stage {
     padding-top: 0;
     min-height: 0;
+    max-height: calc(100dvh - 120px);
     overflow: hidden;
     flex-shrink: 1;
     gap: 0.35rem;
@@ -1258,8 +1261,8 @@ code {
   }
 
   .utility-tray {
-    flex-shrink: 0;
     min-height: 48px;
+    overflow: visible;
   }
 
   .utility-tray:not(.is-collapsed) {
