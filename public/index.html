@@ -86,7 +86,6 @@
             <div class="brand-copy">
               <span class="eyebrow">Codex Remote</span>
               <h1>Remote Console</h1>
-              <p>会话优先，工具按需展开。</p>
             </div>
             <button id="logoutBtn" class="ghost subtle" type="button">退出</button>
           </div>
@@ -171,16 +170,40 @@
       </aside>
 
       <main class="main">
-        <header class="card compact main-header thread-summary-card">
+        <header class="main-header thread-titlebar">
           <div class="thread-header-copy">
-            <span id="activeThreadTitle" class="thread-title-inline">未选择会话</span>
-            <span id="activeThreadMeta" class="thread-meta-inline muted">先从左侧选一个会话，或新建一个。</span>
-            <div id="activeThreadPath" class="path-pill muted">cwd: —</div>
+            <div class="thread-title-row">
+              <span id="activeThreadTitle" class="thread-title-inline">未选择会话</span>
+              <span id="activeThreadStatus" class="thread-status-chip muted">idle</span>
+            </div>
+            <div class="thread-subline">
+              <span id="activeThreadMeta" class="thread-meta-inline muted">先从左侧选一个会话，或新建一个。</span>
+              <div id="activeThreadPath" class="path-pill muted">cwd: —</div>
+            </div>
           </div>
-          <div class="row gap-wrap">
-            <button id="resumeThreadBtn" class="ghost" disabled>恢复</button>
-            <button id="reloadThreadBtn" class="ghost" disabled>重载</button>
-            <button id="interruptTurnBtn" class="danger" disabled>中断</button>
+          <div class="thread-actions" role="toolbar" aria-label="会话操作">
+            <button id="resumeThreadBtn" class="ghost thread-action icon-only" type="button" title="重新连接当前会话" aria-label="重新连接当前会话" disabled>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
+                <path d="M21 3v6h-6"></path>
+              </svg>
+              <span class="sr-only thread-action-label">重新连接当前会话</span>
+            </button>
+            <button id="reloadThreadBtn" class="ghost thread-action icon-only" type="button" title="刷新当前会话" aria-label="刷新当前会话" disabled>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 12a9 9 0 0 1 15.55-6.36L21 8"></path>
+                <path d="M21 3v5h-5"></path>
+                <path d="M21 12a9 9 0 0 1-15.55 6.36L3 16"></path>
+                <path d="M8 16H3v5"></path>
+              </svg>
+              <span class="sr-only thread-action-label">刷新当前会话</span>
+            </button>
+            <button id="interruptTurnBtn" class="danger thread-action icon-only" type="button" title="停止当前运行" aria-label="停止当前运行" disabled>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <rect x="7" y="7" width="10" height="10" rx="1.8"></rect>
+              </svg>
+              <span class="sr-only thread-action-label">停止当前运行</span>
+            </button>
           </div>
         </header>
 
@@ -236,10 +259,15 @@
 
     <template id="threadItemTemplate">
       <button class="thread-item">
-        <div class="thread-item-title"></div>
+        <div class="thread-item-top">
+          <div class="thread-item-title"></div>
+          <span class="thread-item-status">idle</span>
+        </div>
         <div class="thread-item-preview"></div>
-        <div class="thread-item-path"></div>
-        <div class="thread-item-meta"></div>
+        <div class="thread-item-bottom">
+          <div class="thread-item-path"></div>
+          <div class="thread-item-meta"></div>
+        </div>
       </button>
     </template>
 

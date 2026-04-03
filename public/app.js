@@ -16,6 +16,7 @@ const state = {
   utilityTab: 'approvals',
   utilityTrayOpen: false,
   sidebarOpen: false,
+  collapsedThreadGroups: new Set(),
   auth: {
     required: true,
     authenticated: false,
@@ -70,6 +71,21 @@ function shortPath(value) {
   if (!parts.length) return normalized;
   if (parts.length <= 4) return normalized;
   return `.../${parts.slice(-3).join('/')}`;
+}
+
+function normalizeThreadCwd(value) {
+  return String(value || '')
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .trim();
+}
+
+function folderNameFromCwd(value) {
+  const normalized = normalizeThreadCwd(value);
+  if (!normalized) return '未设置目录';
+  const parts = normalized.split('/').filter(Boolean);
+  if (!parts.length) return normalized;
+  return parts[parts.length - 1];
 }
 
 function normalizeApprovalPolicy(value) {
@@ -188,13 +204,19 @@ async function api(path, options = {}) {
 
 let bannerTimeout = null;
 
-function setBanner(message, kind = 'info') {
+function setBanner(message, kind = 'info', options = {}) {
+  const { persistent = false } = options;
   el.statusBanner.textContent = message;
   el.statusBanner.className = `status-banner ${kind === 'error' ? 'error' : ''}`.trim();
 
   if (bannerTimeout) {
     clearTimeout(bannerTimeout);
+    bannerTimeout = null;
   }
+  if (persistent) {
+    return;
+  }
+
   bannerTimeout = setTimeout(() => {
     if (el.statusBanner.textContent === message) {
       el.statusBanner.textContent = '';
@@ -390,6 +412,8 @@ function renderHealth() {
   const health = state.health;
   if (!health) {
     el.healthPanel.innerHTML = '';
+    el.statusBanner.textContent = '';
+    el.statusBanner.className = 'status-banner is-hidden';
     return;
   }
 
@@ -397,8 +421,11 @@ function renderHealth() {
     ['模式', health.mode || 'unknown'],
     ['状态', health.status || 'unknown'],
     ['PID', health.pid || '—'],
-    ['初始化', health.initialized ? 'yes' : 'no'],
   ];
+
+  if (!health.initialized) {
+    tiles.push(['初始化', 'no']);
+  }
 
   el.healthPanel.innerHTML = tiles
     .map(
@@ -411,13 +438,43 @@ function renderHealth() {
     )
     .join('');
 
-  const lastError = health.lastError ? ` · ${health.lastError}` : '';
-  const fallback = health.fallbackReason ? ` · fallback: ${health.fallbackReason}` : '';
-  setBanner(`模式 ${health.mode || 'unknown'}，状态 ${health.status || 'unknown'}${lastError}${fallback}`, health.lastError ? 'error' : 'info');
+  const status = String(health.status || 'unknown').toLowerCase();
+  const shouldShowBanner = Boolean(health.lastError || health.fallbackReason || !['ready', 'spawned'].includes(status));
+  if (!shouldShowBanner) {
+    el.statusBanner.textContent = '';
+    el.statusBanner.className = 'status-banner is-hidden';
+    return;
+  }
+
+  const parts = [`模式 ${health.mode || 'unknown'}`, `状态 ${health.status || 'unknown'}`];
+  if (health.lastError) {
+    parts.push(health.lastError);
+  }
+  if (health.fallbackReason) {
+    parts.push(`fallback: ${health.fallbackReason}`);
+  }
+  setBanner(parts.join(' · '), health.lastError ? 'error' : 'info', {
+    persistent: true,
+  });
 }
 
 function deriveThreadTitle(thread) {
   return thread?.name || thread?.preview || thread?.id || '未命名会话';
+}
+
+function statusChipClass(status) {
+  return `thread-status-chip ${statusToneClass(status)}`;
+}
+
+function statusToneClass(status) {
+  const value = String(status || 'unknown').toLowerCase();
+  if (['active', 'inprogress', 'running'].includes(value)) {
+    return 'is-active';
+  }
+  if (['error', 'failed', 'interrupted'].includes(value)) {
+    return 'is-error';
+  }
+  return 'is-idle';
 }
 
 function deriveActiveTurnId(thread) {
@@ -450,6 +507,10 @@ function visitThreadInstances(threadId, visitor) {
 
 function getPendingSendForThread(threadId) {
   return state.pendingSend?.threadId === threadId ? state.pendingSend : null;
+}
+
+function getPendingSend() {
+  return state.pendingSend;
 }
 
 function matchesPendingSendTurn(pendingSend, turn) {
@@ -661,7 +722,7 @@ async function recoverClientState(reason = 'reconnect') {
       await refreshThreadFromServer(state.activeThreadId);
     }
 
-    if (state.pendingSend?.status === 'uncertain') {
+    if (state.pendingSend) {
       await reconcilePendingSend({ ...state.pendingSend });
     }
   })().finally(() => {
@@ -733,6 +794,40 @@ function syncThreadsFromList(threads) {
   renderThreadList();
 }
 
+function groupThreadsByCwd(threads = []) {
+  const groups = new Map();
+
+  for (const thread of threads) {
+    const cwd = normalizeThreadCwd(thread.cwd);
+    const key = cwd || '__no_cwd__';
+    let group = groups.get(key);
+    if (!group) {
+      group = {
+        key,
+        cwd,
+        title: folderNameFromCwd(cwd),
+        threads: [],
+        updatedAt: 0,
+      };
+      groups.set(key, group);
+    }
+    group.threads.push(thread);
+    group.updatedAt = Math.max(group.updatedAt, Number(thread.updatedAt || 0));
+  }
+
+  return [...groups.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+function toggleThreadGroup(groupKey) {
+  if (!groupKey) return;
+  if (state.collapsedThreadGroups.has(groupKey)) {
+    state.collapsedThreadGroups.delete(groupKey);
+  } else {
+    state.collapsedThreadGroups.add(groupKey);
+  }
+  renderThreadList();
+}
+
 function renderThreadList() {
   const list = state.threads;
   if (el.threadCountBadge) {
@@ -745,28 +840,68 @@ function renderThreadList() {
 
   const template = qs('threadItemTemplate');
   el.threadList.innerHTML = '';
-  for (const thread of list) {
-    const fragment = template.content.cloneNode(true);
-    const button = fragment.querySelector('.thread-item');
-    button.dataset.threadId = thread.id;
-    button.classList.toggle('active', thread.id === state.activeThreadId);
-    fragment.querySelector('.thread-item-title').textContent = deriveThreadTitle(thread);
-    fragment.querySelector('.thread-item-preview').textContent = thread.preview || '暂无预览';
-    fragment.querySelector('.thread-item-path').textContent = `cwd: ${shortPath(thread.cwd)}`;
-    const status = thread.status?.type || 'unknown';
-    fragment.querySelector('.thread-item-meta').textContent = `${fmtCompactTime(thread.updatedAt)} · ${status}`;
-    el.threadList.appendChild(fragment);
+  const groups = groupThreadsByCwd(list);
+  for (const group of groups) {
+    const section = document.createElement('section');
+    section.className = 'thread-group';
+    const isCollapsed = state.collapsedThreadGroups.has(group.key);
+
+    const header = document.createElement('button');
+    header.type = 'button';
+    header.className = 'thread-group-head';
+    header.dataset.groupKey = group.key;
+    header.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+    header.innerHTML = `
+      <span class="thread-group-chevron ${isCollapsed ? 'is-collapsed' : ''}" aria-hidden="true">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 18 15 12 9 6"></polyline>
+        </svg>
+      </span>
+      <div class="thread-group-copy">
+        <div class="thread-group-title">${escapeHtml(group.title)}</div>
+        <div class="thread-group-path">${escapeHtml(group.cwd || '未设置工作目录')}</div>
+      </div>
+      <span class="thread-group-count">${group.threads.length}</span>
+    `;
+    section.appendChild(header);
+
+    const items = document.createElement('div');
+    items.className = `thread-group-items${isCollapsed ? ' is-collapsed' : ''}`;
+
+    for (const thread of group.threads) {
+      const fragment = template.content.cloneNode(true);
+      const button = fragment.querySelector('.thread-item');
+      button.dataset.threadId = thread.id;
+      button.classList.toggle('active', thread.id === state.activeThreadId);
+      const status = thread.status?.type || 'unknown';
+      fragment.querySelector('.thread-item-title').textContent = deriveThreadTitle(thread);
+      fragment.querySelector('.thread-item-status').textContent = status;
+      fragment.querySelector('.thread-item-status').className = `thread-item-status ${statusToneClass(status)}`;
+      fragment.querySelector('.thread-item-preview').textContent = thread.preview || '暂无预览';
+      fragment.querySelector('.thread-item-path').textContent = shortPath(thread.cwd);
+      fragment.querySelector('.thread-item-meta').textContent = fmtCompactTime(thread.updatedAt);
+      items.appendChild(fragment);
+    }
+
+    section.appendChild(items);
+    el.threadList.appendChild(section);
   }
 }
 
 function renderActiveThreadHeader() {
   const thread = state.currentThread;
   const activeTurnId = deriveActiveTurnId(thread);
-  const pendingSend = thread ? getPendingSendForThread(thread.id) : null;
+  const pendingSend = getPendingSend();
+  const pendingSendBlocksCurrentThread = Boolean(pendingSend);
   if (!thread) {
     el.activeThreadTitle.textContent = '未选择会话';
     el.activeThreadMeta.textContent = '先从左侧选一个会话，或新建一个。';
+    if (el.activeThreadStatus) {
+      el.activeThreadStatus.textContent = 'idle';
+      el.activeThreadStatus.className = 'thread-status-chip is-idle';
+    }
     if (el.activeThreadPath) el.activeThreadPath.textContent = 'cwd: —';
+    el.resumeThreadBtn.hidden = true;
     el.resumeThreadBtn.disabled = true;
     el.reloadThreadBtn.disabled = true;
     el.interruptTurnBtn.disabled = true;
@@ -777,22 +912,34 @@ function renderActiveThreadHeader() {
   }
 
   const status = thread.status?.type || 'unknown';
+  const canResumeThread = status === 'notLoaded';
   el.activeThreadTitle.textContent = deriveThreadTitle(thread);
-  el.activeThreadMeta.textContent = `${status} · 更新于 ${fmtTime(thread.updatedAt)} · 线程 ${shortId(thread.id)}`;
+  if (el.activeThreadStatus) {
+    el.activeThreadStatus.textContent = status;
+    el.activeThreadStatus.className = statusChipClass(status);
+  }
+  el.activeThreadMeta.textContent = `更新于 ${fmtTime(thread.updatedAt)} · 线程 ${shortId(thread.id)}`;
   if (el.activeThreadPath) {
     el.activeThreadPath.textContent = `cwd: ${thread.cwd || '—'}`;
     el.activeThreadPath.title = thread.cwd || '—';
   }
-  el.resumeThreadBtn.disabled = false;
+  el.resumeThreadBtn.hidden = !canResumeThread;
+  el.resumeThreadBtn.disabled = !canResumeThread;
+  const resumeLabel = canResumeThread ? '重新连接当前会话' : '当前会话已连接';
+  el.resumeThreadBtn.title = resumeLabel;
+  el.resumeThreadBtn.setAttribute('aria-label', resumeLabel);
+  el.resumeThreadBtn.querySelector('.thread-action-label').textContent = resumeLabel;
   el.reloadThreadBtn.disabled = false;
 
   // 中断按钮：有活跃 turn 时可用
   el.interruptTurnBtn.disabled = !activeTurnId;
 
   // 发送按钮：根据发送状态决定
-  if (pendingSend) {
+  if (pendingSendBlocksCurrentThread) {
     el.sendMessageBtn.disabled = true;
-    if (pendingSend.status === 'uncertain') {
+    if (pendingSend.threadId !== thread.id) {
+      el.sendMessageBtn.textContent = '另一会话发送中...';
+    } else if (pendingSend.status === 'uncertain') {
       el.sendMessageBtn.textContent = '确认中...';
     } else {
       el.sendMessageBtn.textContent = pendingSend.mode === 'start' && !pendingSend.realTurnId ? '创建中...' : '发送中...';
@@ -803,7 +950,7 @@ function renderActiveThreadHeader() {
   }
 
   // 输入框状态：发送中禁用
-  el.composerInput.disabled = Boolean(pendingSend);
+  el.composerInput.disabled = pendingSendBlocksCurrentThread;
 
   // 更新移动端标题
   renderMobileHeader();
@@ -1227,7 +1374,11 @@ async function sendComposerMessage(event) {
     return;
   }
 
-  if (getPendingSendForThread(state.currentThread.id)) {
+  const activePendingSend = getPendingSend();
+  if (activePendingSend) {
+    if (activePendingSend.threadId !== state.currentThread.id) {
+      setBanner('另一个会话正在发送中，请等待当前请求确认后再继续。', 'error');
+    }
     return;
   }
 
@@ -1505,8 +1656,6 @@ function handleJsonRpc(msg) {
     case 'turn/completed': {
       const turn = msg.params?.turn;
       const threadId = turn?.threadId ?? msg.params?.threadId;
-      console.log('[turn/completed] 收到事件:', { turn, threadId, currentThreadId: state.currentThread?.id, pendingSend: state.pendingSend });
-
       if (!turn || !threadId) {
         if (state.activeThreadId) {
           refreshThreadFromServer(state.activeThreadId).catch(() => {});
@@ -1730,6 +1879,7 @@ async function initialize() {
     refreshThreadsBtn: qs('refreshThreadsBtn'),
     threadList: qs('threadList'),
     activeThreadTitle: qs('activeThreadTitle'),
+    activeThreadStatus: qs('activeThreadStatus'),
     activeThreadMeta: qs('activeThreadMeta'),
     activeThreadPath: qs('activeThreadPath'),
     resumeThreadBtn: qs('resumeThreadBtn'),
@@ -1841,6 +1991,7 @@ async function initialize() {
     state.threadMap.clear();
     state.activeThreadId = null;
     state.currentThread = null;
+    state.collapsedThreadGroups.clear();
     state.pendingApprovals.clear();
     state.latestDiffByTurn.clear();
     state.pendingSend = null;
@@ -1873,8 +2024,17 @@ async function initialize() {
 
   // 事件委托：线程列表点击
   el.threadList.addEventListener('click', (event) => {
+    const groupToggle = event.target.closest('.thread-group-head');
+    if (groupToggle?.dataset.groupKey) {
+      toggleThreadGroup(groupToggle.dataset.groupKey);
+      return;
+    }
+
     const button = event.target.closest('.thread-item');
     if (button?.dataset.threadId) {
+      const thread = state.threadMap.get(button.dataset.threadId);
+      const groupKey = normalizeThreadCwd(thread?.cwd) || '__no_cwd__';
+      state.collapsedThreadGroups.delete(groupKey);
       openThread(button.dataset.threadId);
       closeSidebar(); // 移动端选择会话后关闭侧边栏
     }

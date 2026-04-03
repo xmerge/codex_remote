@@ -1250,10 +1250,24 @@ class MockCodexBridge extends BaseBridge {
       const thread = this.threads.get(threadId);
       const turn = this._findTurn(threadId, turnId);
       if (thread && turn) {
+        for (const [requestId, entry] of this.pendingServerRequests.entries()) {
+          if (entry.params?.threadId !== threadId || entry.params?.turnId !== turnId) continue;
+          this.pendingServerRequests.delete(requestId);
+          this._emitNotification('serverRequest/resolved', { threadId, requestId });
+        }
+
+        for (const item of turn.items) {
+          if (item?.status !== 'inProgress') continue;
+          item.status = 'interrupted';
+          this._emitNotification('item/completed', { threadId, turnId, item: deepClone(item) });
+        }
+
         turn.status = 'interrupted';
         thread.status = { type: 'idle' };
         this.activeTurns.delete(threadId);
         this.pendingSimulations.delete(turnId);
+        this._touchThread(threadId);
+        this._emitNotification('thread/status/changed', { threadId, status: deepClone(thread.status) });
         this._emitNotification('turn/completed', {
           turn: { id: turn.id, threadId, status: 'interrupted', items: deepClone(turn.items), error: null },
         });
