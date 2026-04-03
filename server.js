@@ -19,6 +19,20 @@ const SESSION_SECRET = process.env.SESSION_SECRET || `${EFFECTIVE_ACCESS_KEY}:se
 const SESSION_KEY = crypto.createHash('sha256').update(SESSION_SECRET).digest();
 const AUTH_SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 const AUTH_ENABLED = process.env.DISABLE_AUTH === '1' ? false : true;
+const EXTERNAL_MODE = process.env.EXTERNAL_MODE === '1';
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
+const COOKIE_SECURE_MODE = process.env.COOKIE_SECURE_MODE || 'auto';
+const AUDIT_LOG_ENABLED = process.env.AUDIT_LOG_ENABLED !== '0';
+const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || path.join(__dirname, 'logs', 'audit.jsonl');
+const HOST = process.env.HOST || (EXTERNAL_MODE ? '127.0.0.1' : '0.0.0.0');
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 8;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+const STATE_CHANGING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const CSRF_HEADER_NAME = 'x-codex-requested-with';
+const CSRF_HEADER_VALUE = 'codex-remote-web';
+
+const loginAttemptStore = new Map();
 
 function nowUnix() {
   return Math.floor(Date.now() / 1000);
@@ -49,6 +63,51 @@ function base64UrlEncode(value) {
 
 function base64UrlDecode(value) {
   return Buffer.from(value, 'base64url');
+}
+
+function getForwardedValue(header) {
+  return String(header || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)[0] || '';
+}
+
+function getClientIp(req) {
+  if (TRUST_PROXY) {
+    const forwardedFor = getForwardedValue(req.headers['x-forwarded-for']);
+    if (forwardedFor) return forwardedFor;
+  }
+  return req.socket.remoteAddress || '';
+}
+
+function getRequestProtocol(req) {
+  if (TRUST_PROXY) {
+    const forwardedProto = getForwardedValue(req.headers['x-forwarded-proto']);
+    if (forwardedProto) return forwardedProto;
+  }
+  return req.socket.encrypted ? 'https' : 'http';
+}
+
+function getRequestHost(req) {
+  if (TRUST_PROXY) {
+    const forwardedHost = getForwardedValue(req.headers['x-forwarded-host']);
+    if (forwardedHost) return forwardedHost;
+  }
+  return req.headers.host || 'localhost';
+}
+
+function getRequestOrigin(req) {
+  return `${getRequestProtocol(req)}://${getRequestHost(req)}`;
+}
+
+function isSecureRequest(req) {
+  return getRequestProtocol(req) === 'https';
+}
+
+function shouldUseSecureCookies(req) {
+  if (COOKIE_SECURE_MODE === 'always') return true;
+  if (COOKIE_SECURE_MODE === 'never') return false;
+  return isSecureRequest(req);
 }
 
 function parseCookies(req) {
@@ -94,13 +153,13 @@ function decryptSession(token) {
   }
 }
 
-function makeSessionCookie(token, expiresAt) {
+function makeSessionCookie(token, expiresAt, secure) {
   const expires = new Date(expiresAt).toUTCString();
-  return `${AUTH_COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Strict; Expires=${expires}`;
+  return `${AUTH_COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Strict; Expires=${expires}${secure ? '; Secure' : ''}`;
 }
 
-function clearSessionCookie() {
-  return `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+function clearSessionCookie(secure) {
+  return `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT${secure ? '; Secure' : ''}`;
 }
 
 function getAuthState(req) {
@@ -120,6 +179,10 @@ function isAuthorized(req) {
   return getAuthState(req).authenticated;
 }
 
+function getSessionId(req) {
+  return getAuthState(req).session?.sid || null;
+}
+
 function verifyAccessKey(input) {
   if (!AUTH_ENABLED) return true;
   if (typeof input !== 'string' || !input) return false;
@@ -132,6 +195,11 @@ function verifyAccessKey(input) {
 
 function unauthorized(res) {
   return json(res, 401, { error: 'Unauthorized' });
+}
+
+function tooManyRequests(res, retryAfterSeconds, message = 'Too many requests') {
+  res.setHeader('Retry-After', String(retryAfterSeconds));
+  return json(res, 429, { error: message, retryAfterSeconds });
 }
 
 function safeJsonParse(line) {
@@ -194,6 +262,133 @@ function normalizeApprovalPolicy(value) {
     onRequest: 'on-request',
   };
   return mapping[value] || value || 'untrusted';
+}
+
+function ensureAuditLogDir() {
+  if (!AUDIT_LOG_ENABLED) return;
+  fs.mkdirSync(path.dirname(AUDIT_LOG_PATH), { recursive: true });
+}
+
+function writeAuditLog(entry) {
+  if (!AUDIT_LOG_ENABLED) return;
+  try {
+    ensureAuditLogDir();
+    fs.appendFileSync(AUDIT_LOG_PATH, `${JSON.stringify(entry)}\n`, 'utf8');
+  } catch (error) {
+    console.error('[audit] failed to write audit log:', error);
+  }
+}
+
+function audit(req, event, details = {}) {
+  writeAuditLog({
+    ts: new Date().toISOString(),
+    event,
+    ip: getClientIp(req),
+    method: req.method || '',
+    path: req.url || '',
+    userAgent: req.headers['user-agent'] || '',
+    origin: req.headers.origin || '',
+    sessionId: getSessionId(req),
+    details,
+  });
+}
+
+function pruneLoginAttempts(ip, now = Date.now()) {
+  const bucket = loginAttemptStore.get(ip);
+  if (!bucket) return null;
+  bucket.failures = bucket.failures.filter((ts) => now - ts <= LOGIN_WINDOW_MS);
+  if (bucket.blockUntil && bucket.blockUntil <= now) {
+    bucket.blockUntil = 0;
+  }
+  if (!bucket.failures.length && !bucket.blockUntil) {
+    loginAttemptStore.delete(ip);
+    return null;
+  }
+  return bucket;
+}
+
+function getLoginBucket(ip) {
+  const existing = pruneLoginAttempts(ip);
+  if (existing) return existing;
+  const bucket = { failures: [], blockUntil: 0 };
+  loginAttemptStore.set(ip, bucket);
+  return bucket;
+}
+
+function getLoginRateLimit(ip) {
+  const now = Date.now();
+  const bucket = pruneLoginAttempts(ip, now);
+  if (!bucket || !bucket.blockUntil || bucket.blockUntil <= now) {
+    return { blocked: false, retryAfterSeconds: 0 };
+  }
+  return {
+    blocked: true,
+    retryAfterSeconds: Math.max(1, Math.ceil((bucket.blockUntil - now) / 1000)),
+  };
+}
+
+function registerFailedLogin(ip) {
+  const now = Date.now();
+  const bucket = getLoginBucket(ip);
+  bucket.failures.push(now);
+  if (bucket.failures.length >= LOGIN_MAX_FAILURES) {
+    bucket.blockUntil = now + LOGIN_LOCKOUT_MS;
+  }
+  return getLoginRateLimit(ip);
+}
+
+function clearLoginAttempts(ip) {
+  loginAttemptStore.delete(ip);
+}
+
+function applySecurityHeaders(req, res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'",
+  );
+  if (isSecureRequest(req)) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+}
+
+function verifyStateChangingRequest(req) {
+  if (!STATE_CHANGING_METHODS.has(req.method || '')) {
+    return { ok: true };
+  }
+
+  const csrfHeader = req.headers[CSRF_HEADER_NAME];
+  if (csrfHeader !== CSRF_HEADER_VALUE) {
+    return { ok: false, status: 403, message: 'Missing CSRF request header' };
+  }
+
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (fetchSite && !['same-origin', 'same-site', 'none'].includes(fetchSite)) {
+    return { ok: false, status: 403, message: 'Cross-site request blocked' };
+  }
+
+  const expectedOrigin = getRequestOrigin(req);
+  const origin = String(req.headers.origin || '').trim();
+  if (origin && origin !== expectedOrigin) {
+    return { ok: false, status: 403, message: 'Origin mismatch' };
+  }
+
+  const referer = String(req.headers.referer || '').trim();
+  if (!origin && referer) {
+    try {
+      const refererOrigin = new URL(referer).origin;
+      if (refererOrigin !== expectedOrigin) {
+        return { ok: false, status: 403, message: 'Referer mismatch' };
+      }
+    } catch {
+      return { ok: false, status: 403, message: 'Invalid referer' };
+    }
+  }
+
+  return { ok: true };
 }
 
 function execFileAsync(command, args) {
@@ -1153,6 +1348,21 @@ function serveStatic(req, res, pathname) {
 }
 
 (async function main() {
+  if (EXTERNAL_MODE) {
+    if (!CONFIGURED_ACCESS_KEY && !process.env.ACCESS_KEY_HASH) {
+      console.error('EXTERNAL_MODE requires ACCESS_KEY, APP_ACCESS_KEY, or ACCESS_KEY_HASH to be explicitly configured.');
+      process.exit(1);
+    }
+    if (!process.env.SESSION_SECRET) {
+      console.error('EXTERNAL_MODE requires SESSION_SECRET to be explicitly configured.');
+      process.exit(1);
+    }
+    if (COOKIE_SECURE_MODE === 'never') {
+      console.error('EXTERNAL_MODE does not allow COOKIE_SECURE_MODE=never.');
+      process.exit(1);
+    }
+  }
+
   let bridge;
   try {
     bridge = await createBridge();
@@ -1188,28 +1398,63 @@ function serveStatic(req, res, pathname) {
     try {
       const url = new URL(req.url, `http://${req.headers.host}`);
       const { pathname } = url;
+      applySecurityHeaders(req, res);
+
+      if (pathname.startsWith('/api/')) {
+        const requestCheck = verifyStateChangingRequest(req);
+        if (!requestCheck.ok) {
+          audit(req, 'request.blocked.csrf', { reason: requestCheck.message, pathname });
+          return json(res, requestCheck.status || 403, { error: requestCheck.message || 'Forbidden' });
+        }
+      }
 
       if (req.method === 'GET' && pathname === '/api/auth/status') {
         return json(res, 200, getAuthState(req));
       }
 
       if (req.method === 'POST' && pathname === '/api/auth/login') {
+        const clientIp = getClientIp(req);
+        const rateLimit = getLoginRateLimit(clientIp);
+        if (rateLimit.blocked) {
+          audit(req, 'auth.login.blocked', { retryAfterSeconds: rateLimit.retryAfterSeconds });
+          return tooManyRequests(res, rateLimit.retryAfterSeconds, '登录尝试过多，请稍后再试');
+        }
         const body = await readJsonBody(req);
         if (!verifyAccessKey(body.key)) {
+          const nextRateLimit = registerFailedLogin(clientIp);
+          audit(req, 'auth.login.failure', { retryAfterSeconds: nextRateLimit.retryAfterSeconds || 0 });
+          if (nextRateLimit.blocked) {
+            return tooManyRequests(res, nextRateLimit.retryAfterSeconds, '登录尝试过多，请稍后再试');
+          }
           return json(res, 401, { error: '密钥错误' });
         }
+        clearLoginAttempts(clientIp);
         const expiresAt = Date.now() + AUTH_SESSION_TTL_MS;
-        const token = encryptSession({ exp: expiresAt });
-        res.setHeader('Set-Cookie', makeSessionCookie(token, expiresAt));
+        const sessionPayload = { exp: expiresAt, sid: crypto.randomUUID() };
+        const token = encryptSession(sessionPayload);
+        res.setHeader('Set-Cookie', makeSessionCookie(token, expiresAt, shouldUseSecureCookies(req)));
+        writeAuditLog({
+          ts: new Date().toISOString(),
+          event: 'auth.login.success',
+          ip: clientIp,
+          method: req.method || '',
+          path: req.url || '',
+          userAgent: req.headers['user-agent'] || '',
+          origin: req.headers.origin || '',
+          sessionId: sessionPayload.sid,
+          details: {},
+        });
         return json(res, 200, { ok: true, authenticated: true, required: AUTH_ENABLED });
       }
 
       if (req.method === 'POST' && pathname === '/api/auth/logout') {
-        res.setHeader('Set-Cookie', clearSessionCookie());
+        audit(req, 'auth.logout', {});
+        res.setHeader('Set-Cookie', clearSessionCookie(shouldUseSecureCookies(req)));
         return json(res, 200, { ok: true });
       }
 
       if (pathname.startsWith('/api/') && !isAuthorized(req)) {
+        audit(req, 'request.blocked.unauthorized', { pathname });
         return unauthorized(res);
       }
 
@@ -1257,14 +1502,30 @@ function serveStatic(req, res, pathname) {
       }
 
       if (req.method === 'POST' && pathname === '/api/system/pick-directory') {
+        if (EXTERNAL_MODE) {
+          audit(req, 'system.pickDirectory.blocked', { reason: 'EXTERNAL_MODE' });
+          return json(res, 403, { error: 'Directory picker is disabled in EXTERNAL_MODE' });
+        }
         const body = await readJsonBody(req);
         const result = await pickDirectoryNative(body.startPath);
+        audit(req, 'system.pickDirectory', {
+          cancelled: Boolean(result.cancelled),
+          startPath: body.startPath || '',
+          selectedPath: result.path || '',
+        });
         return json(res, 200, result);
       }
 
       if (req.method === 'POST' && pathname === '/api/threads') {
         const body = await readJsonBody(req);
         const result = await bridge.startThread(body);
+        audit(req, 'thread.create', {
+          threadId: result.thread?.id || '',
+          model: body.model || '',
+          cwd: body.cwd || '',
+          approvalPolicy: body.approvalPolicy || '',
+          sandboxType: body.sandboxPolicy?.type || '',
+        });
         return json(res, 200, result);
       }
 
@@ -1273,6 +1534,10 @@ function serveStatic(req, res, pathname) {
         const threadId = decodeURIComponent(threadResumeMatch[1]);
         const body = await readJsonBody(req);
         const result = await bridge.resumeThread(threadId, body);
+        audit(req, 'thread.resume', {
+          threadId,
+          model: body.model || '',
+        });
         return json(res, 200, result);
       }
 
@@ -1284,6 +1549,11 @@ function serveStatic(req, res, pathname) {
           ...body,
           input: [{ type: 'text', text: body.text || '' }],
         }));
+        audit(req, 'turn.start', {
+          threadId,
+          textPreview: String(body.text || '').slice(0, 160),
+          turnId: result.turn?.id || '',
+        });
         return json(res, 200, result);
       }
 
@@ -1295,6 +1565,11 @@ function serveStatic(req, res, pathname) {
         const result = await withAutoResume(bridge, threadId, () => bridge.steerTurn(threadId, turnId, {
           input: [{ type: 'text', text: body.text || '' }],
         }));
+        audit(req, 'turn.steer', {
+          threadId,
+          turnId,
+          textPreview: String(body.text || '').slice(0, 160),
+        });
         return json(res, 200, result);
       }
 
@@ -1303,6 +1578,7 @@ function serveStatic(req, res, pathname) {
         const threadId = decodeURIComponent(interruptMatch[1]);
         const turnId = decodeURIComponent(interruptMatch[2]);
         const result = await bridge.interruptTurn(threadId, turnId);
+        audit(req, 'turn.interrupt', { threadId, turnId });
         return json(res, 200, result);
       }
 
@@ -1314,6 +1590,10 @@ function serveStatic(req, res, pathname) {
           ? { decision: body.decision }
           : body;
         const result = await bridge.respondToServerRequest(requestId, payload);
+        audit(req, 'approval.respond', {
+          requestId,
+          decision: payload?.decision || '',
+        });
         return json(res, 200, result);
       }
 
@@ -1332,8 +1612,8 @@ function serveStatic(req, res, pathname) {
     }
   });
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Codex Remote Web MVP listening on http://localhost:${PORT}`);
+  server.listen(PORT, HOST, () => {
+    console.log(`Codex Remote Web MVP listening on http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
     if (AUTH_ENABLED) {
       if (CONFIGURED_ACCESS_KEY) {
         console.log('Auth enabled with configured ACCESS_KEY.');

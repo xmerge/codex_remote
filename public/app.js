@@ -154,6 +154,7 @@ async function api(path, options = {}) {
     signal,
     headers: {
       'Content-Type': 'application/json',
+      'X-Codex-Requested-With': 'codex-remote-web',
       ...(options.headers || {}),
     },
   });
