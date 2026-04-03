@@ -75,6 +75,8 @@ npm start
 codex app-server
 ```
 
+如果真实连接启动失败，服务现在会继续启动，但 `/api/health` 会保持 `real/error` 状态并在前端显示常驻告警；只有显式设置 `ALLOW_MOCK_FALLBACK=1` 时，才会退回到 `mock-fallback`。
+
 如果需要自定义命令：
 
 ```bash

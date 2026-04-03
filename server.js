@@ -565,7 +565,7 @@ class RealCodexBridge extends BaseBridge {
       proc.once('exit', (code, signal) => {
         this.exited = true;
         const message = `app-server exited${code !== null ? ` with code ${code}` : ''}${signal ? ` (signal ${signal})` : ''}`;
-        this._setHealth({ status: 'exited', lastError: message, initialized: false, pid: null });
+        this._setHealth({ status: 'stopped', lastError: message, initialized: false, pid: null });
         for (const pending of this.pendingResponses.values()) {
           pending.reject(new Error(message));
         }
@@ -755,6 +755,64 @@ class RealCodexBridge extends BaseBridge {
   }
 }
 
+class UnavailableCodexBridge extends BaseBridge {
+  constructor(options = {}) {
+    super();
+    this.startupError = options.error instanceof Error ? options.error : new Error(String(options.error || 'Codex bridge is unavailable'));
+    this.health = {
+      ...this.health,
+      mode: 'real',
+      status: 'error',
+      initialized: false,
+      command: options.command || 'codex app-server',
+      lastError: this.startupError.message,
+      fallbackReason: null,
+    };
+  }
+
+  async start() {
+    this._emitEvent('connection', this.getHealth());
+  }
+
+  _makeUnavailableError() {
+    const error = new Error(`Codex bridge is unavailable: ${this.startupError.message}`);
+    error.code = 'CODEX_BRIDGE_UNAVAILABLE';
+    return error;
+  }
+
+  async listThreads() {
+    return { data: [], nextCursor: null };
+  }
+
+  async readThread() {
+    throw this._makeUnavailableError();
+  }
+
+  async startThread() {
+    throw this._makeUnavailableError();
+  }
+
+  async resumeThread() {
+    throw this._makeUnavailableError();
+  }
+
+  async startTurn() {
+    throw this._makeUnavailableError();
+  }
+
+  async steerTurn() {
+    throw this._makeUnavailableError();
+  }
+
+  async interruptTurn() {
+    throw this._makeUnavailableError();
+  }
+
+  async respondToServerRequest() {
+    throw this._makeUnavailableError();
+  }
+}
+
 class MockCodexBridge extends BaseBridge {
   constructor(options = {}) {
     super();
@@ -765,8 +823,8 @@ class MockCodexBridge extends BaseBridge {
     this.health = {
       ...this.health,
       mode: this.mode,
-      status: 'ready',
-      initialized: true,
+      status: this.mode === 'mock-fallback' ? 'degraded' : 'ready',
+      initialized: this.mode === 'mock-fallback' ? false : true,
       command: 'mock-app-server',
       fallbackReason: options.fallbackReason || null,
     };
@@ -1310,12 +1368,17 @@ async function createBridge() {
     await realBridge.start();
     return realBridge;
   } catch (error) {
-    if (process.env.ALLOW_MOCK_FALLBACK === '0') {
-      throw error;
+    if (process.env.ALLOW_MOCK_FALLBACK === '1') {
+      const fallback = new MockCodexBridge({ mode: 'mock-fallback', fallbackReason: error.message });
+      await fallback.start();
+      return fallback;
     }
-    const fallback = new MockCodexBridge({ mode: 'mock-fallback', fallbackReason: error.message });
-    await fallback.start();
-    return fallback;
+    const unavailable = new UnavailableCodexBridge({
+      error,
+      command: [realBridge.command, ...realBridge.args].join(' '),
+    });
+    await unavailable.start();
+    return unavailable;
   }
 }
 

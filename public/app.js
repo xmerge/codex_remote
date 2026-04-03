@@ -4,6 +4,8 @@ const state = {
   threadMap: new Map(),
   activeThreadId: null,
   currentThread: null,
+  openThreadRequestSeq: 0,
+  recoveryGeneration: 0,
   pendingApprovals: new Map(),
   pendingApprovalActions: new Map(),
   rawEvents: [],
@@ -203,24 +205,55 @@ async function api(path, options = {}) {
 }
 
 let bannerTimeout = null;
+let persistentBanner = null;
+let transientBanner = null;
+
+function renderBanner() {
+  const activeBanner = persistentBanner || transientBanner;
+  if (!activeBanner) {
+    el.statusBanner.textContent = '';
+    el.statusBanner.className = 'status-banner is-hidden';
+    return;
+  }
+
+  const suffix = persistentBanner && transientBanner ? ` · ${transientBanner.message}` : '';
+  const tone = persistentBanner?.kind === 'error' || transientBanner?.kind === 'error' ? 'error' : activeBanner.kind;
+  el.statusBanner.textContent = `${activeBanner.message}${suffix}`;
+  el.statusBanner.className = `status-banner ${tone === 'error' ? 'error' : ''}`.trim();
+}
 
 function setBanner(message, kind = 'info', options = {}) {
   const { persistent = false } = options;
-  el.statusBanner.textContent = message;
-  el.statusBanner.className = `status-banner ${kind === 'error' ? 'error' : ''}`.trim();
+  const target = persistent ? 'persistent' : 'transient';
+
+  if (!message) {
+    if (target === 'persistent') {
+      persistentBanner = null;
+    } else {
+      transientBanner = null;
+    }
+    renderBanner();
+    return;
+  }
+
+  if (target === 'persistent') {
+    persistentBanner = { message, kind };
+    renderBanner();
+    return;
+  }
+
+  transientBanner = { message, kind };
+  renderBanner();
 
   if (bannerTimeout) {
     clearTimeout(bannerTimeout);
     bannerTimeout = null;
   }
-  if (persistent) {
-    return;
-  }
 
   bannerTimeout = setTimeout(() => {
-    if (el.statusBanner.textContent === message) {
-      el.statusBanner.textContent = '';
-      el.statusBanner.className = 'status-banner';
+    if (transientBanner?.message === message) {
+      transientBanner = null;
+      renderBanner();
     }
   }, 5000);
 }
@@ -412,8 +445,7 @@ function renderHealth() {
   const health = state.health;
   if (!health) {
     el.healthPanel.innerHTML = '';
-    el.statusBanner.textContent = '';
-    el.statusBanner.className = 'status-banner is-hidden';
+    setBanner('', 'info', { persistent: true });
     return;
   }
 
@@ -441,8 +473,7 @@ function renderHealth() {
   const status = String(health.status || 'unknown').toLowerCase();
   const shouldShowBanner = Boolean(health.lastError || health.fallbackReason || !['ready', 'spawned'].includes(status));
   if (!shouldShowBanner) {
-    el.statusBanner.textContent = '';
-    el.statusBanner.className = 'status-banner is-hidden';
+    setBanner('', 'info', { persistent: true });
     return;
   }
 
@@ -453,7 +484,7 @@ function renderHealth() {
   if (health.fallbackReason) {
     parts.push(`fallback: ${health.fallbackReason}`);
   }
-  setBanner(parts.join(' · '), health.lastError ? 'error' : 'info', {
+  setBanner(parts.join(' · '), health.lastError || status === 'error' ? 'error' : 'info', {
     persistent: true,
   });
 }
@@ -485,6 +516,17 @@ function deriveActiveTurnId(thread) {
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function bumpRecoveryGeneration() {
+  state.recoveryGeneration += 1;
+  return state.recoveryGeneration;
+}
+
+function isCurrentThreadRequest(threadId, requestSeq = null) {
+  if (state.activeThreadId !== threadId) return false;
+  if (requestSeq !== null && requestSeq !== state.openThreadRequestSeq) return false;
+  return true;
 }
 
 function visitThreadInstances(threadId, visitor) {
@@ -698,42 +740,59 @@ function scheduleLoadThreads(delay = 160) {
 }
 
 async function recoverClientState(reason = 'reconnect') {
-  if (recoveryPromise) {
-    return recoveryPromise;
-  }
+  const generation = bumpRecoveryGeneration();
+  const recoveryActiveThreadId = state.activeThreadId;
+  const pendingSnapshot = state.pendingSend ? { ...state.pendingSend } : null;
 
-  recoveryPromise = (async () => {
+  const currentRecovery = (async () => {
     addRawEvent('state.recover', {
       reason,
+      generation,
       activeThreadId: state.activeThreadId,
-      pendingSend: state.pendingSend
+      pendingSend: pendingSnapshot
         ? {
-            threadId: state.pendingSend.threadId,
-            mode: state.pendingSend.mode,
-            status: state.pendingSend.status,
-            realTurnId: state.pendingSend.realTurnId,
+            threadId: pendingSnapshot.threadId,
+            mode: pendingSnapshot.mode,
+            status: pendingSnapshot.status,
+            realTurnId: pendingSnapshot.realTurnId,
           }
         : null,
     });
 
     await Promise.all([loadHealth(), loadThreads(), loadPendingApprovals()]);
-
-    if (state.activeThreadId) {
-      await refreshThreadFromServer(state.activeThreadId);
+    if (generation !== state.recoveryGeneration) {
+      return;
     }
 
-    if (state.pendingSend) {
-      await reconcilePendingSend({ ...state.pendingSend });
+    if (recoveryActiveThreadId && state.activeThreadId === recoveryActiveThreadId) {
+      await refreshThreadFromServer(recoveryActiveThreadId, { requestSeq: state.openThreadRequestSeq });
+    }
+    if (generation !== state.recoveryGeneration) {
+      return;
+    }
+
+    if (pendingSnapshot && state.pendingSend?.startedAt === pendingSnapshot.startedAt) {
+      await reconcilePendingSend({ ...state.pendingSend }, { recoveryGeneration: generation });
     }
   })().finally(() => {
-    recoveryPromise = null;
+    if (recoveryPromise === currentRecovery) {
+      recoveryPromise = null;
+    }
   });
 
-  return recoveryPromise;
+  recoveryPromise = currentRecovery;
+  return currentRecovery;
 }
 
-async function reconcilePendingSend(snapshot = state.pendingSend) {
-  if (!snapshot || !state.pendingSend || state.pendingSend.startedAt !== snapshot.startedAt) {
+async function reconcilePendingSend(snapshot = state.pendingSend, options = {}) {
+  const { recoveryGeneration = null } = options;
+  const isSnapshotActive = () =>
+    Boolean(snapshot) &&
+    Boolean(state.pendingSend) &&
+    state.pendingSend.startedAt === snapshot.startedAt &&
+    (recoveryGeneration === null || recoveryGeneration === state.recoveryGeneration);
+
+  if (!isSnapshotActive()) {
     return;
   }
 
@@ -743,7 +802,7 @@ async function reconcilePendingSend(snapshot = state.pendingSend) {
       await wait(delay);
     }
 
-    if (!state.pendingSend || state.pendingSend.startedAt !== snapshot.startedAt) {
+    if (!isSnapshotActive()) {
       return;
     }
 
@@ -758,6 +817,9 @@ async function reconcilePendingSend(snapshot = state.pendingSend) {
 
     const matchedTurn = findMatchingTurn(thread, snapshot);
     if (matchedTurn) {
+      if (!isSnapshotActive()) {
+        return;
+      }
       state.pendingSend.realTurnId = matchedTurn.id;
       state.pendingSend.status = matchedTurn.status === 'inProgress' ? 'streaming' : 'completed';
       renderActiveThreadHeader();
@@ -768,6 +830,9 @@ async function reconcilePendingSend(snapshot = state.pendingSend) {
     }
   }
 
+  if (!isSnapshotActive()) {
+    return;
+  }
   cleanupOptimisticTurn(snapshot.threadId, snapshot.tempTurnId);
   cleanupOptimisticMessage(snapshot.threadId, snapshot.realTurnId || snapshot.expectedTurnId, snapshot.tempMessageId);
   clearPendingSend();
@@ -1254,10 +1319,11 @@ async function loadThreads() {
   }
 }
 
-async function refreshThreadFromServer(threadId) {
+async function refreshThreadFromServer(threadId, options = {}) {
+  const { requestSeq = null } = options;
   const result = await api(`/api/threads/${encodeURIComponent(threadId)}`);
   upsertThread(result.thread);
-  if (state.activeThreadId === threadId) {
+  if (isCurrentThreadRequest(threadId, requestSeq)) {
     state.currentThread = result.thread;
     renderConversation();
   } else {
@@ -1267,13 +1333,19 @@ async function refreshThreadFromServer(threadId) {
 }
 
 async function openThread(threadId, { silent = false } = {}) {
+  bumpRecoveryGeneration();
+  const requestSeq = ++state.openThreadRequestSeq;
   state.activeThreadId = threadId;
   renderThreadList();
-  const thread = await refreshThreadFromServer(threadId);
+  const thread = await refreshThreadFromServer(threadId, { requestSeq });
+  if (!isCurrentThreadRequest(threadId, requestSeq)) {
+    return thread;
+  }
   scrollConversationToBottom();
   if (!silent) {
     setBanner(`已打开 ${deriveThreadTitle(thread)}`);
   }
+  return thread;
 }
 
 function ensureCurrentThread() {
@@ -1384,6 +1456,7 @@ async function sendComposerMessage(event) {
 
   const text = el.composerInput.value.trim();
   if (!text) return;
+  bumpRecoveryGeneration();
 
   let thread;
   try {
@@ -1996,6 +2069,8 @@ async function initialize() {
     state.latestDiffByTurn.clear();
     state.pendingSend = null;
     state.rawEvents = [];
+    setBanner('', 'info');
+    setBanner('', 'info', { persistent: true });
     renderHealth();
     renderThreadList();
     renderConversation();
